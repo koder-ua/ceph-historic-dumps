@@ -1,0 +1,12 @@
+[Unit]
+Description=Mirantis ceph historic ops dumper
+After=multi-user.target
+
+[Service]
+Type=idle
+ExecStart=/tmp/ceph-ho-dumper.sh dump /tmp/historic_ops_dump.log 60 100 /tmp/ceph_ho_dumper.log
+StandardOutput=null
+
+[Install]
+WantedBy=multi-user.target
+Alias=ceph-ho-dumper
