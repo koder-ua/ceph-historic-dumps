@@ -2,7 +2,7 @@
 set -e
 set -o pipefail
 
-BIN=ceph-ho-dumper.sh
+BIN=ceph-ho-dumper.py
 NODES="ceph01 ceph02 ceph03"
 TARGET=/tmp/$BIN
 LOG=/tmp/ceph_ho_dumper.log

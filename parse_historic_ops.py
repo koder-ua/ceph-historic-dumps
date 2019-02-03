@@ -6,9 +6,12 @@ from collections import Counter, defaultdict
 from typing import Dict, Iterator, Tuple, Iterable, List, Set
 
 import numpy
-import seaborn
+import matplotlib
 from matplotlib import pyplot
 from dataclasses import dataclass
+
+
+matplotlib.rcParams.update({'font.size': 22})
 
 
 IO_WRITE = "write"
@@ -88,22 +91,13 @@ def parse_file(fname: str) -> Iterator[OP]:
             curr_data += line
 
 
-def make_histo(ops: Iterable[OP]) ->Tuple[int, int, int, int, int]:
-    res = [0, 0, 0, 0, 0]
-    for op in ops:
-        if op.op_type == OSD_REPOP:
-            if op.duration < 10:
-                res[0] += 1
-            elif op.duration >= 10000:
-                res[4] += 1
-            elif op.duration < 100:
-                res[1] += 1
-            elif op.duration < 1000:
-                res[2] += 1
-            else:
-                assert op.duration < 10000
-                res[3] += 1
-    return tuple(res)
+def show_histo(ops: Iterable[OP]):
+    bins = numpy.array([100 * i for i in range(10)] + [1000 * i for i in range(1, 10)] + [20000, 30000, 100000])
+    times = [op.duration for op in ops if op.io_type == IO_WRITE and op.op_type == OSD_OP]
+    res, _ = numpy.histogram(times, bins)
+    res[-2] += res[-1]
+    for start, stop, res in zip(bins[1:-2], bins[2:-1], res[1:-1]):
+        print(f"{start:>5d}ms ~ {stop:>5d}ms  {res:>8d}")
 
 
 def top_slow_pgs(ops: Iterable[OP]):
@@ -111,17 +105,20 @@ def top_slow_pgs(ops: Iterable[OP]):
     for op in ops:
         res[op.pg] += 1
 
-    for pg, cnt in sorted(res.items(), key=lambda x: -x[1])[:10]:
+    for pg, cnt in sorted(res.items(), key=lambda x: -x[1])[:20]:
         print(f"{pg:>8s}  {cnt:>5d}")
 
 
-def top_slow_osds(ops: Iterable[OP], pg_map: Dict[str, List[int]]):
+def top_slow_osds(ops: Iterable[OP], pg_map: Dict[str, List[int]], is_read: bool = False):
     res = Counter()
     for op in ops:
-        for osd in pg_map[op.pg]:
-            res[osd] += 1
+        if is_read:
+            res[pg_map[op.pg][0]] += 1
+        else:
+            for osd in pg_map[op.pg]:
+                res[osd] += 1
 
-    for osd, cnt in sorted(res.items(), key=lambda x: -x[1])[:15]:
+    for osd, cnt in sorted(res.items(), key=lambda x: -x[1])[:20]:
         print(f"{osd:>8d}  {cnt:>5d}")
 
 
@@ -172,43 +169,25 @@ def filter_optype(ops: Iterable[OP], op_types: Set[str]) -> Iterable[OP]:
     return (op for op in ops if op.op_type in op_types)
 
 
-def per_PG_OSD_stat(all_ops: List[OP]):
-    pg_map = json.load(open("pg_mapping.json"))
-    longer_100ms = list(filter_duration(all_ops, 100, 1000))
-    longer_1s = list(filter_duration(all_ops, 1000, 10000))
-    longer_10s = list(filter_duration(all_ops, 10000, 100000))
+def per_PG_OSD_stat(all_ops: List[OP], pg_map: Dict):
+    longer_100ms = list(filter_duration(all_ops, 100))
+    # longer_1s = list(filter_duration(all_ops, 1000, 10000))
+    # longer_10s = list(filter_duration(all_ops, 10000, 100000))
 
     print("Reads most slow OSDS")
-    print("------------- 100ms -----------------")
-    top_slow_osds(filter_iotype(longer_100ms, {IO_READ}), pg_map)
-    print("------------- 1s --------------------")
-    top_slow_osds(filter_iotype(longer_1s, {IO_READ}), pg_map)
-    print("------------- 10s -------------------")
-    top_slow_osds(filter_iotype(longer_10s, {IO_READ}), pg_map)
+    top_slow_osds(filter_iotype(longer_100ms, {IO_READ}), pg_map, True)
 
     print("Writes most slow OSDS")
     print("------------- 100ms -----------------")
     top_slow_osds(filter_iotype(longer_100ms, {IO_WRITE}), pg_map)
-    print("------------- 1s --------------------")
-    top_slow_osds(filter_iotype(longer_1s, {IO_WRITE}), pg_map)
-    print("------------- 10s -------------------")
-    top_slow_osds(filter_iotype(longer_10s, {IO_WRITE}), pg_map)
 
     print("Reads most slow PGS")
     print("------------- 100ms -----------------")
     top_slow_pgs(filter_iotype(longer_100ms, {IO_READ}))
-    print("------------- 1s --------------------")
-    top_slow_pgs(filter_iotype(longer_1s, {IO_READ}))
-    print("------------- 10s -------------------")
-    top_slow_pgs(filter_iotype(longer_10s, {IO_READ}))
 
     print("Writes most slow PGS")
     print("------------- 100ms -----------------")
     top_slow_pgs(filter_iotype(longer_100ms, {IO_WRITE}))
-    print("------------- 1s --------------------")
-    top_slow_pgs(filter_iotype(longer_1s, {IO_WRITE}))
-    print("------------- 10s -------------------")
-    top_slow_pgs(filter_iotype(longer_10s, {IO_WRITE}))
 
 
 def stages_stat(ops: List[OP]):
@@ -264,6 +243,8 @@ def plot_op_time_distribution(all_ops: List[OP], min_time: int = 100, max_time: 
     bins_centers = (bins[1:] + bins[:-1]) / 2
     vals = numpy.clip(vals, 0, 200)
     pyplot.plot(bins_centers, vals, linestyle='--', marker='o', color='b')
+    pyplot.xlabel('Request latency, ms')
+    pyplot.ylabel('Request count, clipped on 200 ')
     pyplot.show()
 
 
@@ -297,6 +278,8 @@ def plot_stages_part_distribution(all_ops: List[OP], min_time: int = 100, max_ti
         vals = [dct.get(stage, 0) for dct in scaled]
         pyplot.plot(range(len(vals)), vals, linestyle='--', marker='o', label=stage)
 
+    pyplot.xlabel('Request latency, logscale')
+    pyplot.ylabel('Time part, consumed by different stages')
     pyplot.legend()
     pyplot.show()
 
@@ -308,11 +291,14 @@ def main(argv):
         for op_tp in json.load(fd):
             all_ops.append(OP(*op_tp))
 
-    # per_PG_OSD_stat(all_ops)
+    # pg_map = json.load(open("/home/koder/workspace/support/wob2/pg_mapping.json"))
+    # per_PG_OSD_stat(all_ops, pg_map)
     # stages_stat(all_ops)
 
-    plot_stages_part_distribution(all_ops)
+    # plot_stages_part_distribution(all_ops)
+    # plot_op_time_distribution(all_ops)
 
+    show_histo(all_ops)
     # p10, p100, p1000, p10000, p100000 = make_histo(all_ops)
     # print(f" 10ms: {p10:>10d}\n100ms: {p100:>10d}\n   1s: {p1000:>10d}\n  10s: {p10000:>10d}\n 100s: {p100000:>10d}")
 

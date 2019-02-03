@@ -4,7 +4,7 @@ After=multi-user.target
 
 [Service]
 Type=idle
-ExecStart=/tmp/ceph-ho-dumper.sh dump /tmp/historic_ops_dump.log 60 100 /tmp/ceph_ho_dumper.log
+ExecStart=/tmp/ceph-ho-dumper.py dump /tmp/historic_ops_dump.log 10 10 /tmp/ceph_ho_dumper.log
 StandardOutput=null
 
 [Install]
