@@ -6,6 +6,17 @@ import socket
 import os.path
 import datetime
 import subprocess
+from struct import Struct
+
+OSD_OP_I = 0
+OSD_REPOP_I = 1
+
+IO_WRITE_I = 0
+IO_READ_I = 1
+IO_UNKNOWN_I = 2
+
+
+format = Struct("!HBBLLlllllBH")
 
 
 def get_ids(expected_class=None):
@@ -51,21 +62,76 @@ def set_size_duration(osd_ids, size, duration):
     return not_inited_osd
 
 
-def to_unix_mks(dtm):
+def to_unix_dms(dtm):
     # "2019-02-03 20:53:47.429996"
     date, tm = dtm.split()
     y, m, d = date.split("-")
     h, min, smks = tm.split(':')
     s, mks = smks.split(".")
     d = datetime.datetime(int(y), int(m), int(d), int(h), int(min), int(s))
-    return int(time.mktime(d.timetuple()) * 1000000) + int(mks)
+    return int(time.mktime(d.timetuple()) * 10000) + int(mks) // 100
+
+
+def pack_to_str(op, osd_id):
+    description = op['description']
+    op_type_s, _ = description.split("(", 1)
+
+    if op_type_s == 'osd_op':
+        op_type = OSD_OP_I
+    elif op_type_s == 'osd_repop':
+        op_type = OSD_REPOP_I
+    else:
+        return ""
+
+    if '+write+' in description:
+        io_type = IO_WRITE_I
+    elif '+read+' in description:
+        io_type = IO_READ_I
+    else:
+        io_type = IO_UNKNOWN_I
+
+    initiated_at = to_unix_dms(op['initiated_at'])
+    stages = {evt["event"]: to_unix_dms(evt["time"]) - initiated_at
+              for evt in op["type_data"]["events"] if evt["event"] != "initiated"}
+
+    try:
+        qpg_at = op["queued_for_pg"]
+    except KeyError:
+        qpg_at = -1
+
+    try:
+        started = stages["started"]
+    except KeyError:
+        started = -1
+
+    try:
+        local_done = stages["op_applied"] if 'op_applied' in stages else stages["done"]
+    except KeyError:
+        local_done = -1
+
+    replicas_waiting = -1
+    subop = -1
+    for op, tm in stages.items():
+        if op.startswith("waiting for subops from"):
+            replicas_waiting = tm
+        elif op.startswith("sub_op_commit_rec from"):
+            subop = tm
+
+    pool_s, pg_s = description.split()[1].split(".")
+    pool = int(pool_s)
+    pg = int(pg_s, 16)
+
+    op_duration = int(op['duration'] * 10000)
+
+    return format.pack(osd_id, op_type, io_type, op_duration, initiated_at,
+                       qpg_at, started, local_done, replicas_waiting, subop, pool, pg)
 
 
 def main(argv):
     osd_ids = get_ids()
 
     if argv[1] == 'set':
-        set_size_duration(osd_ids, int(argv[2]), int(argv[3]))
+        set_size_duration(osd_ids, duration=int(argv[2]), size=int(argv[3]))
         return 1
 
     assert argv[1] == 'dump'
@@ -84,7 +150,7 @@ def main(argv):
     log_file_fd.write("Find next osds = {}\n".format(osd_ids))
     log_file_fd.flush()
 
-    mode = "r+" if os.path.exists(output_fd) else "w"
+    mode = "rb+" if os.path.exists(output_fd) else "wb"
     with open(output_fd, mode) as fd:
         while True:
             start_time = time.time()
@@ -99,22 +165,16 @@ def main(argv):
                     except ValueError:
                         not_inited_osd.add(osd_id)
                         continue
+
                     parsed = json.loads(data)
                     if size != parsed['size'] or duration != parsed['duration']:
                         not_inited_osd.add(osd_id)
                         continue
 
-                    for op in parsed['ops']:
-                        description = op['description']
-                        initiated_at = op['initiated_at']
-                        initiated_at_mks = to_unix_mks(initiated_at)
-                        op_duration = op['duration']
-                        evts = ["{} {}".format(evt["event"], to_unix_mks(evt["time"]) - initiated_at_mks)
-                                for evt in op["type_data"]["events"] if evt["event"] != "initiated"]
-                        data = "{}|{}|{}|{}|{}\n".format(osd_id, initiated_at,
-                                                         op_duration, "|".join(evts), description)
-                        fd.write(data)
+                    fd.write("".join(pack_to_str(op, osd_id) for op in parsed['ops']))
+
             fd.flush()
+
             stime = start_time + duration - time.time()
             if stime > 0:
                 time.sleep(stime)
