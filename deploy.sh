@@ -8,7 +8,7 @@ set -o pipefail
 COMPRESSOR="lzma -9 -z -k -f"
 EXT="lzma"
 
-BIN=ceph-ho-dumper.py
+BIN=ceph_ho_dumper.py
 NODES="ceph01 ceph02 ceph03"
 TARGET="/tmp/$BIN"
 LOG=/tmp/ceph_ho_dumper.log

@@ -15,8 +15,11 @@ IO_WRITE_I = 0
 IO_READ_I = 1
 IO_UNKNOWN_I = 2
 
+MKS_TO_MS = 1000
+S_TO_MS = 1000
 
-format = Struct("!HBBLLlllllBH")
+
+OPRecort = Struct("!HBBLQlllllBH")
 
 
 def get_ids(expected_class=None):
@@ -62,14 +65,14 @@ def set_size_duration(osd_ids, size, duration):
     return not_inited_osd
 
 
-def to_unix_dms(dtm):
+def to_unix_ms(dtm):
     # "2019-02-03 20:53:47.429996"
     date, tm = dtm.split()
     y, m, d = date.split("-")
     h, min, smks = tm.split(':')
     s, mks = smks.split(".")
     d = datetime.datetime(int(y), int(m), int(d), int(h), int(min), int(s))
-    return int(time.mktime(d.timetuple()) * 10000) + int(mks) // 100
+    return int(time.mktime(d.timetuple()) * S_TO_MS) + int(mks) // MKS_TO_MS
 
 
 def pack_to_str(op, osd_id):
@@ -90,12 +93,12 @@ def pack_to_str(op, osd_id):
     else:
         io_type = IO_UNKNOWN_I
 
-    initiated_at = to_unix_dms(op['initiated_at'])
-    stages = {evt["event"]: to_unix_dms(evt["time"]) - initiated_at
+    initiated_at = to_unix_ms(op['initiated_at'])
+    stages = {evt["event"]: to_unix_ms(evt["time"]) - initiated_at
               for evt in op["type_data"]["events"] if evt["event"] != "initiated"}
 
     try:
-        qpg_at = op["queued_for_pg"]
+        qpg_at = stages["queued_for_pg"]
     except KeyError:
         qpg_at = -1
 
@@ -111,20 +114,22 @@ def pack_to_str(op, osd_id):
 
     replicas_waiting = -1
     subop = -1
-    for op, tm in stages.items():
-        if op.startswith("waiting for subops from"):
+    for evt, tm in stages.items():
+        if evt.startswith("waiting for subops from"):
             replicas_waiting = tm
-        elif op.startswith("sub_op_commit_rec from"):
+        elif evt.startswith("sub_op_commit_rec from"):
             subop = tm
 
     pool_s, pg_s = description.split()[1].split(".")
     pool = int(pool_s)
     pg = int(pg_s, 16)
 
-    op_duration = int(op['duration'] * 10000)
+    op_duration = int(op['duration']) // MKS_TO_MS
 
-    return format.pack(osd_id, op_type, io_type, op_duration, initiated_at,
-                       qpg_at, started, local_done, replicas_waiting, subop, pool, pg)
+    print([repr(i) for i in (osd_id, op_type, io_type, op_duration, initiated_at,
+                       qpg_at, started, local_done, replicas_waiting, subop, pool, pg)])
+    return OPRecort.pack(osd_id, op_type, io_type, op_duration, initiated_at,
+                         qpg_at, started, local_done, replicas_waiting, subop, pool, pg)
 
 
 def main(argv):
@@ -171,7 +176,7 @@ def main(argv):
                         not_inited_osd.add(osd_id)
                         continue
 
-                    fd.write("".join(pack_to_str(op, osd_id) for op in parsed['ops']))
+                    fd.write("".join(pack_to_str(op, int(osd_id)) for op in parsed['ops']))
 
             fd.flush()
 
