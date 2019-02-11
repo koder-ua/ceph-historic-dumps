@@ -11,7 +11,7 @@ import matplotlib
 from dataclasses import dataclass
 from matplotlib import pyplot
 
-from ceph_ho_dumper import OSD_OP_I, OSD_REPOP_I, IO_WRITE_I, IO_UNKNOWN_I, IO_READ_I, OPRecort
+import ceph_ho_dumper
 
 
 matplotlib.rcParams.update({'font.size': 30, 'lines.linewidth': 5})
@@ -168,9 +168,10 @@ def show_histo(df: pandas.DataFrame):
     for name, selector in iter_classes_selector(df):
         for is_read in (True, False):
             if is_read:
-                io_selector = df['io_type'] == IO_READ_I
+                io_selector = df['op_type'] == ceph_ho_dumper.OP_READ
             else:
-                io_selector = (df['io_type'] == IO_WRITE_I) | (df['io_type'] == IO_UNKNOWN_I)
+                io_selector = (df['op_type'] == ceph_ho_dumper.OP_WRITE_SECONDARY) | \
+                              (df['io_type'] == ceph_ho_dumper.OP_WRITE_PRIMARY)
 
             bins = numpy.array([25, 50, 100, 200, 300, 500, 700] +
                                [1000, 3000, 5000, 10000, 20000, 30000, 100000])
@@ -284,51 +285,34 @@ def stat_by_slowness_pd(df: pandas.DataFrame, selector: Any):
 
 
 def parse_logs_info_PD(ops_iterator: Iterable[Tuple[int, ...]]) -> pandas.DataFrame:
-    qpg_lst = []
-    start_lst = []
-    local_lst = []
     osd_ids = []
     durations = []
     op_types = []
     pools = []
     pgs = []
-    io_types = []
+    disk = []
+    wait_for_pg = []
+    dload_lst = []
 
-    for osd_id, op_type, io_type, duration, initiated_at, \
-        qpg_at, started, local_done, replicas_waiting, subop, pool, pg in ops_iterator:
-
-        assert op_type in (OSD_OP_I, OSD_REPOP_I)
-        assert io_type in (IO_WRITE_I, IO_READ_I, IO_UNKNOWN_I)
-
+    for osd_id, op_type, pool, pg, wait_pg, dload, local_io, remote_io in ops_iterator:
+        assert op_type in (ceph_ho_dumper.OP_WRITE_PRIMARY, ceph_ho_dumper.OP_WRITE_SECONDARY, ceph_ho_dumper.OP_READ)
+        duration = (dload if dload != -1 else 0) + wait_pg + max(local_io, remote_io)
         pools.append(pool)
         pgs.append(pg)
         osd_ids.append(osd_id)
         durations.append(duration)
         op_types.append(op_type)
-        io_types.append(io_type)
-        qpg_lst.append(qpg_at)
-        start_lst.append(started)
-        local_lst.append(local_done)
-
-    started_arr = numpy.array(start_lst, dtype=numpy.int32)
-    qpg_at_arr = numpy.array(qpg_lst, dtype=numpy.int32)
-    local_lst = numpy.array(local_lst, dtype=numpy.int32)
-    dload = qpg_at_arr
-
-    wait_for_pg = started_arr - qpg_at_arr
-    wait_for_pg[(started_arr == -1) | (qpg_at_arr == -1)] = -1
-
-    disk = local_lst - started_arr
-    disk[(local_lst == -1) | (started_arr == -1)] = -1
+        disk.append(local_io)
+        wait_for_pg.append(wait_pg)
+        dload_lst.append(dload)
 
     return pandas.DataFrame({
-        'dload': dload,
-        'wait_for_pg': wait_for_pg,
+        'dload': numpy.array(dload_lst, dtype=numpy.uint16),
+        'wait_for_pg': numpy.array(wait_for_pg, dtype=numpy.uint16),
         'disk': disk,
         'osd_id': numpy.array(osd_ids, dtype=numpy.uint16),
         'duration': numpy.array(durations, dtype=numpy.uint32),
         'op_type': numpy.array(op_types, dtype=numpy.uint8),
-        'io_type': numpy.array(io_types, dtype=numpy.uint8),
         'pool': numpy.array(pools, dtype=numpy.uint8),
         'pg': numpy.array(pgs, dtype=numpy.uint32)
     })
@@ -338,18 +322,14 @@ def iterate_op_records(fnames: List[str], limit: int = None) -> Iterator[Tuple[i
     count = 0
     for fname in fnames:
         print(f"Start processing {fname}")
-        with open(fname, 'rb') as fd:
-            mmaped_fd = mmap.mmap(fd.fileno(), 0, access=mmap.PROT_READ)
-            assert len(mmaped_fd) % OPRecort.size == 0, "File corrupted"
-            for offset in range(0, len(mmaped_fd), OPRecort.size):
-                yield OPRecort.unpack(mmaped_fd[offset:offset + OPRecort.size])
-                count += 1
-
-                if limit and count == limit:
-                    return
-
-                if count % 1000000 == 0:
-                    print(f"Processed {count // 1000000} mlns of events")
+        for osd_id, op_type, pool, pg, wait_pg, dload, local_io, remote_io in ceph_ho_dumper.parse(fname):
+            yield osd_id, op_type, pool, pg, wait_pg, (-1 if dload is None else dload), \
+                  (-1 if local_io else local_io), (-1 if remote_io is None else remote_io)
+            count += 1
+            if limit and count == limit:
+                return
+            if count % 1000000 == 0:
+                print(f"Processed {count // 1000000} mlns of events")
     print(f"Total {count} events")
 
 
@@ -429,7 +409,7 @@ def analyze_pgs(pg1_path: str, pg2_path: str):
 
 
 def main(argv):
-    # convert_to_hdfs(argv[1], argv[2:])
+    convert_to_hdfs(argv[1], argv[2:])
 
     # analyze_pgs(argv[1], argv[2])
 
@@ -437,9 +417,9 @@ def main(argv):
 
     sata2_pools_s = (df.pool == 115) | (df.pool == 117)
     slow_req_s = df.duration > 100
-    primary_writes_s = (df.op_type == OSD_OP_I) & (df.io_type == IO_WRITE_I)
-    secondary_writes_s = df.op_type == OSD_REPOP_I
-    writes = (df['io_type'] == IO_WRITE_I) | (df['io_type'] == IO_UNKNOWN_I)
+    primary_writes_s = df.op_type == ceph_ho_dumper.OP_WRITE_PRIMARY
+    secondary_writes_s = df.op_type == ceph_ho_dumper.OP_WRITE_SECONDARY
+    writes = primary_writes_s | secondary_writes_s
 
     # stat_by_slowness_pd(df, sata2_pools_s & writes)
     # show_histo(df)
