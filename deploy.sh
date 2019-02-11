@@ -12,11 +12,17 @@ BIN=ceph_ho_dumper.py
 NODES="ceph01 ceph02 ceph03"
 TARGET="/tmp/$BIN"
 LOG=/tmp/ceph_ho_dumper.log
-RESULT=/tmp/historic_ops_dump.log
+RESULT=/tmp/historic_ops_dump.bin
 
 SRV_FILE=mira-ceph-ho-dumper.service
 SERVICE="$SRV_FILE"
 SRV_FILE_DST_PATH="/lib/systemd/system/$SRV_FILE"
+
+DEFAULT_COUNT=20
+DEFAULT_DURATION=600
+
+DURATION=60
+SIZE=100
 
 
 function clean {
@@ -24,7 +30,7 @@ function clean {
     set +e
     for node in $NODES ; do
         CMD="systemctl stop $SERVICE ; systemctl disable $SERVICE"
-        CMD="$CMD ; $TARGET set 600 20 >/dev/null 2>&1 "
+        CMD="$CMD ; $TARGET set --duration=$DEFAULT_DURATION --count=$DEFAULT_COUNT >/dev/null 2>&1 "
         CMD="$CMD ; rm -f $SRV_FILE_DST_PATH $TARGET $LOG $RESULT"
         echo "$CMD" | ssh "$node" sudo bash
     done
@@ -47,11 +53,11 @@ function deploy {
     set -x
     for node in $NODES ; do
         scp "$BIN" "$node:$TARGET"
-        scp "$SRV_FILE" "$node:/tmp"
+        cat "$SRV_FILE" | sed -e "s/{DURATION}/$DURATION/" -e "s/{SIZE}/$SIZE/" \
+            -e "s/{LOG_FILE}/${LOG//\//\\/}/" -e "s/{RESULT}/${RESULT//\//\\/}/" | ssh "$node" "cat > /tmp/$SRV_FILE"
 
-        CMD="sudo chown root.root $TARGET && sudo chmod +x $TARGET"
-        CMD="$CMD && mv /tmp/$SRV_FILE $SRV_FILE_DST_PATH"
-        CMD="$CMD && chown root.root $SRV_FILE_DST_PATH"
+        CMD="chown root.root $TARGET && chmod +x $TARGET"
+        CMD="$CMD && mv /tmp/$SRV_FILE $SRV_FILE_DST_PATH && chown root.root $SRV_FILE_DST_PATH"
         CMD="$CMD && systemctl daemon-reload && systemctl enable $SERVICE && systemctl start $SERVICE"
         echo "$CMD" | ssh "$node" sudo bash
     done
@@ -67,13 +73,21 @@ function show {
 
     for node in $NODES ; do
         SRV_STAT=$(ssh $node sudo systemctl status $SERVICE | grep Active)
-        if [[ $SRV_STAT == *" inactive "* ]] ; then
-            printf "%-20s : %b %s %b\n" "$node" "$RED" "$SRV_STAT" "$NC"
+        LOG_FILE_LL=$(ssh $node ls -l $RESULT 2>&1)
+
+        if [[ "$LOG_FILE_LL" == *"No such file or directory"* ]] ; then
+            LOG_SIZE="NO FILE"
         else
-            if [[ $SRV_STAT == *" failed "* ]] ; then
-                printf "%-20s : %b %s %b\n" "$node" "$RED" "$SRV_STAT" "$NC"
+            LOG_SIZE=$(echo "$LOG_FILE_LL" | awk '{print $5}')
+        fi
+
+        if [[ "$SRV_STAT" == *" inactive "* ]] ; then
+            printf "%-20s : %b %s %b LOG_FILE_SZ=%s\n" "$node" "$RED" "$SRV_STAT" "$NC" "$LOG_SIZE"
+        else
+            if [[ "$SRV_STAT" == *" failed "* ]] ; then
+                printf "%-20s : %b %s %b LOG_FILE_SZ=%s\n" "$node" "$RED" "$SRV_STAT" "$NC" "$LOG_SIZE"
             else
-                printf "%-20s : %b %s %b\n" "$node" "$GREEN" "$SRV_STAT" "$NC"
+                printf "%-20s : %b %s %b LOG_FILE_SZ=%s\n" "$node" "$GREEN" "$SRV_STAT" "$NC" "$LOG_SIZE"
             fi
         fi
     done

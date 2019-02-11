@@ -1,18 +1,20 @@
+import json
 import sys
 import math
 import mmap
 from collections import Counter
-from typing import Iterator, Tuple, Iterable, List
+from typing import Iterator, Tuple, Iterable, List, Dict, Set, Any
 
 import numpy
 import pandas
 import matplotlib
+from dataclasses import dataclass
 from matplotlib import pyplot
 
 from ceph_ho_dumper import OSD_OP_I, OSD_REPOP_I, IO_WRITE_I, IO_UNKNOWN_I, IO_READ_I, OPRecort
 
 
-matplotlib.rcParams.update({'font.size': 22})
+matplotlib.rcParams.update({'font.size': 30, 'lines.linewidth': 5})
 
 
 #
@@ -140,6 +142,15 @@ matplotlib.rcParams.update({'font.size': 22})
 #     return all_ops
 
 
+@dataclass
+class OpsData:
+    pg_before: Dict
+    pg_after: Dict
+    all_df: pandas.DataFrame
+    slow_df: pandas.DataFrame
+    pools2classes: Dict[str, Set[int]]
+
+
 def top_slow_pgs(df: pandas.DataFrame):
     pgmax = df['pg'].max()
     pg_sorted = (df['pool'].astype('uint64') * pgmax + df['pg'])[df['duration'] > 100].value_counts().sort_values(ascending=False)
@@ -155,23 +166,29 @@ def top_slow_osds(df: pandas.DataFrame):
 
 def show_histo(df: pandas.DataFrame):
     for name, selector in iter_classes_selector(df):
-        writes = (df['io_type'] == IO_WRITE_I) | (df['io_type'] == IO_UNKNOWN_I)
-        bins = numpy.array([25, 50, 75] + [100 * i for i in range(1, 10)] +
-                           [1000 * i for i in range(1, 10)] +
-                           [10000, 20000, 30000, 100000])
-        times = df['duration'][writes & selector]
-        res, _ = numpy.histogram(times, bins)
-        res[-2] += res[-1]
-        print(f"\n-----------------------\nfor class {name}")
-        for start, stop, res in zip(bins[1:-2], bins[2:-1], res[1:-1]):
-            if res != 0:
-                print(f"{start:>5d}ms ~ {stop:>5d}ms  {res:>8d}")
+        for is_read in (True, False):
+            if is_read:
+                io_selector = df['io_type'] == IO_READ_I
+            else:
+                io_selector = (df['io_type'] == IO_WRITE_I) | (df['io_type'] == IO_UNKNOWN_I)
+
+            bins = numpy.array([25, 50, 100, 200, 300, 500, 700] +
+                               [1000, 3000, 5000, 10000, 20000, 30000, 100000])
+            times = df['duration'][io_selector & selector]
+            res, _ = numpy.histogram(times, bins)
+            res[-2] += res[-1]
+            print(f"\n-----------------------\n{'read' if is_read else 'write'} for class {name}")
+            for start, stop, res in zip(bins[1:-2], bins[2:-1], res[1:-1]):
+                if res != 0:
+                    print(f"{start:>5d}ms ~ {stop:>5d}ms  {res:>8d}")
 
 
-def plot_op_time_distribution(df: pandas.DataFrame, min_time: int = 100, max_time: int = 30000, bins: int = 40):
-    pool_selector = (df['pool'] == 115) | (df['pool'] == 117)
-    filter = (df['io_type'] == IO_WRITE_I) & pool_selector
-    times = df['duration'][filter]
+def plot_op_time_distribution(df: pandas.DataFrame,
+                              selector: Any,
+                              min_time: int = 100,
+                              max_time: int = 30000,
+                              bins: int = 40):
+    times = df['duration'][selector]
     bins = numpy.logspace(math.log10(min_time), math.log10(max_time), num=bins)
     bins = [0] + list(bins) + [max(times)]
     vals, _ = numpy.histogram(times, bins)
@@ -186,18 +203,18 @@ def plot_op_time_distribution(df: pandas.DataFrame, min_time: int = 100, max_tim
     pyplot.show()
 
 
-def plot_stages_part_distribution(df: pandas.DataFrame, min_time: int = 100, max_time: int = 30000, bins: int = 20):
-    bins = numpy.logspace(math.log10(min_time), math.log10(max_time), num=bins)
-
-    io_selector = (df['op_type'] == OSD_OP_I) & (df['io_type'] == IO_WRITE_I)
-    # io_selector = df['op_type'] == OSD_REPOP_I
-    pool_selector = (df['pool'] == 115) | (df['pool'] == 117)
-    cselector = io_selector & pool_selector
-
+def plot_stages_part_distribution(df: pandas.DataFrame,
+                                  cselector: Any,
+                                  min_time: int = 100,
+                                  max_time: int = 30000,
+                                  bins: int = 20,
+                                  xticks: Tuple[int, ...]=(100, 200, 300, 500, 700, 1000, 1500,
+                                                           2000, 3000, 5000, 10000, 20000, 30000)):
     disk_vals = []
     net_vals = []
     pg_vals = []
 
+    bins = numpy.logspace(math.log10(min_time), math.log10(max_time), num=bins)
     for min_v, max_v in zip(bins[:-1], bins[1:]):
         selector = (df['duration'] >= min_v) & (df['duration'] < max_v) & cselector
 
@@ -216,16 +233,15 @@ def plot_stages_part_distribution(df: pandas.DataFrame, min_time: int = 100, max
             net_vals.append(float(net) / sum)
             pg_vals.append(float(pg) / sum)
 
-    pyplot.plot(range(len(disk_vals)), disk_vals, linestyle='--', marker='o', label="disk io")
-    pyplot.plot(range(len(net_vals)), net_vals, linestyle='--', marker='o', label="net io")
-    pyplot.plot(range(len(pg_vals)), pg_vals, linestyle='--', marker='o', label="pg lock")
+    pyplot.plot(range(len(disk_vals)), disk_vals, marker='o', label="disk io")
+    pyplot.plot(range(len(net_vals)), net_vals, marker='o', label="net io")
+    pyplot.plot(range(len(pg_vals)), pg_vals, marker='o', label="pg lock")
 
     pyplot.xlabel('Request latency, logscale')
     pyplot.ylabel('Time part, consumed by different stages')
 
-    xticks_v = [100, 200, 300, 500, 700, 1000, 1500, 2000, 3000, 5000, 10000, 20000, 30000]
-    xticks_pos = [math.log10(vl / 100) * ((len(disk_vals) - 1) / math.log10(30000 / 100)) for vl in xticks_v]
-    pyplot.xticks(xticks_pos, list(map(str, xticks_v)))
+    xticks_pos = [math.log10(vl / 100) * ((len(disk_vals) - 1) / math.log10(30000 / 100)) for vl in xticks]
+    pyplot.xticks(xticks_pos, list(map(str, xticks)))
     pyplot.legend()
     pyplot.show()
 
@@ -239,12 +255,11 @@ def iter_classes_selector(df: pandas.DataFrame) -> Iterable[Tuple[str, numpy.nda
         yield name, selector
 
 
-def stat_by_slowness_pd(df: pandas.DataFrame):
-    writes = (df['io_type'] == IO_WRITE_I) | (df['io_type'] == IO_UNKNOWN_I)
+def stat_by_slowness_pd(df: pandas.DataFrame, selector: Any):
     at_least_one_valid = (df['dload'] != -1) | (df['wait_for_pg'] != -1) | (df['disk'] != -1)
-    net_slowest = (df['dload'] > df['wait_for_pg']) & (df['dload'] > df['disk']) & writes & at_least_one_valid
-    disk_slowest = (df['wait_for_pg'] > df['dload']) & (df['wait_for_pg'] > df['disk']) & writes & at_least_one_valid
-    pg_slowest = (df['disk'] > df['wait_for_pg']) & (df['disk'] > df['dload']) & writes & at_least_one_valid
+    net_slowest = (df['dload'] > df['wait_for_pg']) & (df['dload'] > df['disk']) & selector & at_least_one_valid
+    disk_slowest = (df['wait_for_pg'] > df['dload']) & (df['wait_for_pg'] > df['disk']) & selector & at_least_one_valid
+    pg_slowest = (df['disk'] > df['wait_for_pg']) & (df['disk'] > df['dload']) & selector & at_least_one_valid
 
     MS2S = 1000
 
@@ -319,15 +334,15 @@ def parse_logs_info_PD(ops_iterator: Iterable[Tuple[int, ...]]) -> pandas.DataFr
     })
 
 
-def to_iter(fnames: List[str], limit: int = None) -> Iterator[Tuple[int, ...]]:
+def iterate_op_records(fnames: List[str], limit: int = None) -> Iterator[Tuple[int, ...]]:
     count = 0
     for fname in fnames:
         print(f"Start processing {fname}")
         with open(fname, 'rb') as fd:
-            mm = mmap.mmap(fd.fileno(), 0, access=mmap.PROT_READ)
-            assert len(mm) % OPRecort.size == 0, "File corrupted"
-            for i in range(0, len(mm), OPRecort.size):
-                yield OPRecort.unpack(mm[i:i + OPRecort.size])
+            mmaped_fd = mmap.mmap(fd.fileno(), 0, access=mmap.PROT_READ)
+            assert len(mmaped_fd) % OPRecort.size == 0, "File corrupted"
+            for offset in range(0, len(mmaped_fd), OPRecort.size):
+                yield OPRecort.unpack(mmaped_fd[offset:offset + OPRecort.size])
                 count += 1
 
                 if limit and count == limit:
@@ -338,9 +353,9 @@ def to_iter(fnames: List[str], limit: int = None) -> Iterator[Tuple[int, ...]]:
     print(f"Total {count} events")
 
 
-def convert_to_hdfs(target: str, fnames: List[str]):
-    df = parse_logs_info_PD(to_iter(fnames))
-    with pandas.HDFStore(target) as fd:
+def convert_to_hdfs(hdf5_target: str, fnames: List[str]):
+    df = parse_logs_info_PD(iterate_op_records(fnames))
+    with pandas.HDFStore(hdf5_target) as fd:
         fd['load'] = df
     print(len(df))
 
@@ -350,22 +365,92 @@ def load_hdf(fname: str) -> pandas.DataFrame:
         return fd['load']
 
 
+def analyze_pgs(pg1_path: str, pg2_path: str):
+    pg_dump1 = json.load(open(pg1_path))
+    pg_dump2 = json.load(open(pg2_path))
+
+    stats1 = {pg["pgid"]: pg for pg in pg_dump1['pg_stats']}
+    wdiff = []
+    rdiff = []
+    wdiff_osd = Counter()
+    rdiff_osd = Counter()
+    for pg2 in pg_dump2['pg_stats']:
+        if pg2['pgid'].split(".")[0] in ("117", "115"):
+            wd = pg2["stat_sum"]["num_write"] - stats1[pg2['pgid']]["stat_sum"]["num_write"]
+            wdiff.append(wd)
+            for osd_id in pg2["up"]:
+                wdiff_osd[osd_id] += wd
+
+            rd = pg2["stat_sum"]["num_read"] - stats1[pg2['pgid']]["stat_sum"]["num_read"]
+            rdiff.append(rd)
+            rdiff_osd[pg2["up_primary"]] += rd
+
+    wdiff.sort()
+    p5, p50, p95 = numpy.percentile(wdiff, [5, 50, 95])
+    print("Per PG writes:")
+    print(f"  average   {int(numpy.average(wdiff)):>10d}")
+    print(f"      min   {wdiff[0]:>10d}")
+    print(f"    5perc   {int(p5):>10d}")
+    print(f"   50perc   {int(p50):>10d}")
+    print(f"   95perc   {int(p95):>10d}")
+    print(f"      max   {wdiff[-1]:>10d}")
+
+    rdiff.sort()
+    p5, p50, p95 = numpy.percentile(rdiff, [5, 50, 95])
+    print("\nPer PG reads:")
+    print(f"  average   {int(numpy.average(rdiff)):>10d}")
+    print(f"      min   {rdiff[0]:>10d}")
+    print(f"    5perc   {int(p5):>10d}")
+    print(f"   50perc   {int(p50):>10d}")
+    print(f"   95perc   {int(p95):>10d}")
+    print(f"      max   {rdiff[-1]:>10d}")
+
+    wdiff = list(wdiff_osd.values())
+    wdiff.sort()
+    p5, p50, p95 = numpy.percentile(wdiff, [5, 50, 95])
+    print("\nPer OSD writes:")
+    print(f"  average   {int(numpy.average(wdiff)):>10d}")
+    print(f"      min   {wdiff[0]:>10d}")
+    print(f"    5perc   {int(p5):>10d}")
+    print(f"   50perc   {int(p50):>10d}")
+    print(f"   95perc   {int(p95):>10d}")
+    print(f"      max   {wdiff[-1]:>10d}")
+
+    rdiff = list(rdiff_osd.values())
+    rdiff.sort()
+    p5, p50, p95 = numpy.percentile(rdiff, [5, 50, 95])
+    print("\nPer OSD reads:")
+    print(f"  average   {int(numpy.average(rdiff)):>10d}")
+    print(f"      min   {rdiff[0]:>10d}")
+    print(f"    5perc   {int(p5):>10d}")
+    print(f"   50perc   {int(p50):>10d}")
+    print(f"   95perc   {int(p95):>10d}")
+    print(f"      max   {rdiff[-1]:>10d}")
+
+
 def main(argv):
     # convert_to_hdfs(argv[1], argv[2:])
 
-    df = load_hdf(argv[1])
-    stat_by_slowness_pd(df)
-    show_histo(df)
-    top_slow_pgs(df)
-    top_slow_osds(df)
-    # plot_stages_part_distribution(df)
-    # plot_op_time_distribution(df)
+    # analyze_pgs(argv[1], argv[2])
 
+    df = load_hdf(argv[1])
+
+    sata2_pools_s = (df.pool == 115) | (df.pool == 117)
+    slow_req_s = df.duration > 100
+    primary_writes_s = (df.op_type == OSD_OP_I) & (df.io_type == IO_WRITE_I)
+    secondary_writes_s = df.op_type == OSD_REPOP_I
+    writes = (df['io_type'] == IO_WRITE_I) | (df['io_type'] == IO_UNKNOWN_I)
+
+    # stat_by_slowness_pd(df, sata2_pools_s & writes)
+    # show_histo(df)
+    # top_slow_pgs(df)
+    # top_slow_osds(df)
+    plot_stages_part_distribution(df, sata2_pools_s & (primary_writes_s | secondary_writes_s))
+    # plot_op_time_distribution(df, sata2_pools_s & primary_writes_s)
 
     # per_PG_OSD_stat(all_ops, pg_map)
     # stages_stat(all_ops)
     # stat_by_slowness(all_ops)
-    # show_histo(all_ops)
     # p10, p100, p1000, p10000, p100000 = make_histo(all_ops)
     # print(f" 10ms: {p10:>10d}\n100ms: {p100:>10d}\n   1s: {p1000:>10d}\n  10s: {p10000:>10d}\n 100s: {p100000:>10d}")
 
