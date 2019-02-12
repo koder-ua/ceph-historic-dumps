@@ -1,4 +1,7 @@
 #!/usr/bin/env python2
+import errno
+import threading
+
 import math
 import sys
 import json
@@ -58,20 +61,29 @@ def to_unix_ms(dtm):
     return int(time.mktime(d.timetuple()) * S_TO_MS) + int(mks) // MKS_TO_MS
 
 
+def pipe_thread(cmd_q, path="/var/run/ceph-ho-dumper"):
+    try:
+        os.mkfifo(path)
+    except OSError as oe:
+        if oe.errno != errno.EEXIST:
+            raise
+
+    with open(path) as fd:
+        while True:
+            cmd_q.put(fd.readline())
+
+
 def get_timings(op):
     initiated_at = to_unix_ms(op['initiated_at'])
     stages = {evt["event"]: to_unix_ms(evt["time"]) - initiated_at
               for evt in op["type_data"]["events"] if evt["event"] != "initiated"}
 
-    try:
-        qpg_at = stages["queued_for_pg"]
-    except KeyError:
-        qpg_at = -1
+    qpg_at = stages.get("queued_for_pg", -1)
 
     try:
         started = stages["started"]
     except KeyError:
-        started = -1
+        started = stages.get("reached_pg", -1)
 
     try:
         local_done = stages["op_applied"] if 'op_applied' in stages else stages["done"]
@@ -160,9 +172,9 @@ def get_pool_pg(op):
     return int(pool_s), int(pg_s, 16)
 
 
-OPRecortWP = Struct("!BHBBBB")
-OPRecortWS = Struct("!BHBBB")
-OPRecortR = Struct("!BHBB")
+OPRecortWP = Struct("!BHBBBBB")
+OPRecortWS = Struct("!BHBBBB")
+OPRecortR = Struct("!BHBBB")
 
 
 def pack_to_str(op, pools_map):
@@ -188,6 +200,8 @@ def pack_to_str(op, pools_map):
     local_io = local_done - started
     assert local_io >= 0
 
+    duration = op['duration']
+
     if op_type in (OP_WRITE_PRIMARY, OP_WRITE_SECONDARY):
         dload = qpg_at
         if op_type == OP_WRITE_PRIMARY:
@@ -195,13 +209,24 @@ def pack_to_str(op, pools_map):
             assert remote_io >= 0
             assert dload >= 0
             assert remote_io >= 0
-            return OPRecortWP.pack(flags_and_pool, pg, discretize(wait_pg), discretize(dload),
-                                   discretize(local_io), discretize(remote_io))
+            return OPRecortWP.pack(flags_and_pool, pg,
+                                   discretize(duration),
+                                   discretize(wait_pg),
+                                   discretize(dload),
+                                   discretize(local_io),
+                                   discretize(remote_io))
         else:
-            return OPRecortWS.pack(flags_and_pool, pg, discretize(wait_pg), discretize(dload), discretize(local_io))
+            return OPRecortWS.pack(flags_and_pool, pg,
+                                   discretize(duration),
+                                   discretize(wait_pg),
+                                   discretize(dload),
+                                   discretize(local_io))
     else:
         assert op_type == OP_READ
-        return OPRecortR.pack(flags_and_pool, pg, discretize(wait_pg), discretize(local_io))
+        return OPRecortR.pack(flags_and_pool, pg,
+                              discretize(duration),
+                              discretize(wait_pg),
+                              discretize(local_io))
 
 
 def unpack_from_str(data, offset, pool_map):
@@ -210,17 +235,17 @@ def unpack_from_str(data, offset, pool_map):
     pool = pool_map[flags_and_pool & 0x3F]
 
     if op_type == OP_WRITE_PRIMARY:
-        _, pg, wait_pg, dload, local_io, remote_io = OPRecortWP.unpack(data[offset: offset + OPRecortWP.size])
-        return op_type, pool, pg, undiscretize(wait_pg), \
+        _, pg, dura, wait_pg, dload, local_io, remote_io = OPRecortWP.unpack(data[offset: offset + OPRecortWP.size])
+        return op_type, pool, pg, undiscretize(dura), undiscretize(wait_pg), \
                undiscretize(dload), undiscretize(local_io), undiscretize(remote_io), \
                offset + OPRecortWP.size
     if op_type == OP_WRITE_SECONDARY:
-        _, pg, wait_pg, dload, local_io = OPRecortWS.unpack(data[offset: offset + OPRecortWS.size])
-        return op_type, pool, pg, undiscretize(wait_pg), \
+        _, pg, dura, wait_pg, dload, local_io = OPRecortWS.unpack(data[offset: offset + OPRecortWS.size])
+        return op_type, pool, pg, undiscretize(dura), undiscretize(wait_pg), \
                undiscretize(dload), undiscretize(local_io), None, offset + OPRecortWS.size
     assert op_type == OP_READ
-    _, pg, wait_pg, local_io = OPRecortR.unpack(data[offset: offset + OPRecortR.size])
-    return op_type, pool, pg, undiscretize(wait_pg), \
+    _, pg, dura, wait_pg, local_io = OPRecortR.unpack(data[offset: offset + OPRecortR.size])
+    return op_type, pool, pg, undiscretize(dura), undiscretize(wait_pg), \
            None, undiscretize(local_io), None, \
            offset + OPRecortR.size
 
@@ -295,6 +320,13 @@ def dump_loop(opts, osd_ids, fd):
     not_inited_osd = osd_ids.copy()
     prev_ids = set()
 
+    # spawn pipe listen thread
+    import Queue
+    cmd_q = Queue.Queue()
+    th = threading.Thread(target=pipe_thread, args=(cmd_q,))
+    th.daemon = True
+    th.start()
+
     while True:
         start_time = time.time()
         if not_inited_osd:
@@ -324,9 +356,16 @@ def dump_loop(opts, osd_ids, fd):
 
         fd.flush()
 
-        stime = start_time + opts.duration - time.time()
-        if stime > 0:
-            time.sleep(stime)
+        while True:
+            stime = start_time + opts.duration - time.time()
+            if stime < 0:
+                stime = 0
+
+            try:
+                cmd = cmd_q.get(True, stime)
+            except Queue.Empty:
+                break
+
 
 
 class UnexpectedEndOfFile(Exception): pass
@@ -339,54 +378,53 @@ def get_bytes(fd, size):
     return dt
 
 
-def parse(file):
+def parse(fd):
     pools_map = {}
-    with open(file, "rb") as fd:
-        assert fd.read(len(HEADER)) in (HEADER, b""), "Output file corrupted"
-        while True:
-            try:
-                rec_type = ord(get_bytes(fd, 1))
-            except UnexpectedEndOfFile:
-                return
+    assert fd.read(len(HEADER)) in (HEADER, b""), "Output file corrupted"
+    while True:
+        try:
+            rec_type = ord(get_bytes(fd, 1))
+        except UnexpectedEndOfFile:
+            return
 
-            if rec_type == POOLS_RECORD_ID:
-                sz, = struct.unpack("!H", get_bytes(fd, 2))
-                pools_map = {pool_id: (name, orig_id_s)
-                             for orig_id_s, (name, pool_id) in json.loads(get_bytes(fd, sz)).items()}
-            else:
-                assert rec_type == OPS_RECORD_ID, "File corrupted near offset {}".format(fd.tell())
-                osd_id, recsize, _ = struct.unpack("!HHI", get_bytes(fd, 8))
-                data = get_bytes(fd, recsize)
-                offset = 0
-                while offset < len(data):
-                    op_offset = unpack_from_str(data, offset, pools_map)
-                    offset = op_offset[-1]
-                    yield osd_id, op_offset[:-1]
+        if rec_type == POOLS_RECORD_ID:
+            sz, = struct.unpack("!H", get_bytes(fd, 2))
+            pools_map = {pool_id: (name, orig_id_s)
+                         for orig_id_s, (name, pool_id) in json.loads(get_bytes(fd, sz)).items()}
+        else:
+            assert rec_type == OPS_RECORD_ID, "File corrupted near offset {}".format(fd.tell())
+            osd_id, recsize, _ = struct.unpack("!HHI", get_bytes(fd, 8))
+            data = get_bytes(fd, recsize)
+            offset = 0
+            while offset < len(data):
+                op_offset = unpack_from_str(data, offset, pools_map)
+                offset = op_offset[-1]
+                yield (osd_id,) + op_offset[:-1]
 
 
-def format_op(osd_id, op_type, pool_name, pg, wait_pg, dload, local_io, remote_io):
+def format_op(osd_id, op_type, pool_name, pg, dura, wait_pg, dload, local_io, remote_io):
     if op_type == OP_WRITE_PRIMARY:
         assert wait_pg is not None
         assert dload is not None
         assert local_io is not None
         assert remote_io is not None
-        return (("WRITE_PRIMARY   {:>15s}:{:<5x} osd_id={:>4d}   wait_pg={:>5d}   dload={:>5d}" +
+        return (("WRITE_PRIMARY   {:>15s}:{:<5x} osd_id={:>4d}   duration={:>5d}   wait_pg={:>5d}   dload={:>5d}" +
                  "   local_io={:>5d}   remote_io={:>5d}").
-                 format(pool_name, pg, osd_id, int(wait_pg), int(dload), int(local_io), int(remote_io)))
+                 format(pool_name, pg, osd_id, int(dura), int(wait_pg), int(dload), int(local_io), int(remote_io)))
     elif op_type == OP_WRITE_SECONDARY:
         assert wait_pg is not None
         assert dload is not None
         assert local_io is not None
         assert remote_io is None
-        return ("WRITE_SECONDARY {:>15s}:{:<5x} osd_id={:>4d}   wait_pg={:>5d}   dload={:>5d}   local_io={:>5d}".
-                format(pool_name, pg, osd_id, int(wait_pg), int(dload), int(local_io)))
+        return ("WRITE_SECONDARY {:>15s}:{:<5x} osd_id={:>4d}   duration={:>5d}   wait_pg={:>5d}   dload={:>5d}   local_io={:>5d}".
+                format(pool_name, pg, osd_id, int(dura), int(wait_pg), int(dload), int(local_io)))
     elif op_type == OP_READ:
         assert wait_pg is not None
         assert dload is None
         assert local_io is not None
         assert remote_io is None
-        return ("READ            {:>15s}:{:<5x} osd_id={:>4d}   wait_pg={:>5d}   local_io={:>5d}".
-                format(pool_name, pg, osd_id, int(wait_pg), int(local_io)))
+        return ("READ            {:>15s}:{:<5x} osd_id={:>4d}   duration={:>5d}   wait_pg={:>5d}   local_io={:>5d}".
+                format(pool_name, pg, osd_id, int(dura), int(wait_pg), int(local_io)))
     else:
         assert False, "Unknown op"
 
@@ -421,10 +459,11 @@ def main(argv):
         return 0
 
     if opts.subparser_name == 'parse':
-        for idx, (osd_id, (op_type, (pool_name, _), pg, wait_pg, dload, local_io, remote_io)) in enumerate(parse(opts.file)):
-            print(format_op(osd_id, op_type, pool_name, pg, wait_pg, dload, local_io, remote_io))
-            if opts.limit is not None and idx == opts.limit:
-                break
+        with open(opts.file, "rb") as fd:
+            for idx, (osd_id, op_type, (pool_name, _), pg, dura, wait_pg, dload, local_io, remote_io) in enumerate(parse(fd)):
+                print(format_op(osd_id, op_type, pool_name, pg, dura, wait_pg, dload, local_io, remote_io))
+                if opts.limit is not None and idx == opts.limit:
+                    break
 
         return 0
 

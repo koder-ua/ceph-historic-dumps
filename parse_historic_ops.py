@@ -292,11 +292,11 @@ def parse_logs_info_PD(ops_iterator: Iterable[Tuple[int, ...]]) -> pandas.DataFr
     pgs = []
     disk = []
     wait_for_pg = []
-    dload_lst = []
+    dloads = []
 
-    for osd_id, op_type, pool, pg, wait_pg, dload, local_io, remote_io in ops_iterator:
+    for osd_id, op_type, pool, pg, duration, wait_pg, dload, local_io, remote_io in ops_iterator:
         assert op_type in (ceph_ho_dumper.OP_WRITE_PRIMARY, ceph_ho_dumper.OP_WRITE_SECONDARY, ceph_ho_dumper.OP_READ)
-        duration = (dload if dload != -1 else 0) + wait_pg + max(local_io, remote_io)
+        # duration = (dload if dload != -1 else 0) + wait_pg + max(local_io, remote_io)
         pools.append(pool)
         pgs.append(pg)
         osd_ids.append(osd_id)
@@ -304,10 +304,10 @@ def parse_logs_info_PD(ops_iterator: Iterable[Tuple[int, ...]]) -> pandas.DataFr
         op_types.append(op_type)
         disk.append(local_io)
         wait_for_pg.append(wait_pg)
-        dload_lst.append(dload)
+        dloads.append(dload)
 
     return pandas.DataFrame({
-        'dload': numpy.array(dload_lst, dtype=numpy.uint16),
+        'dload': numpy.array(dloads, dtype=numpy.uint16),
         'wait_for_pg': numpy.array(wait_for_pg, dtype=numpy.uint16),
         'disk': disk,
         'osd_id': numpy.array(osd_ids, dtype=numpy.uint16),
@@ -322,14 +322,15 @@ def iterate_op_records(fnames: List[str], limit: int = None) -> Iterator[Tuple[i
     count = 0
     for fname in fnames:
         print(f"Start processing {fname}")
-        for osd_id, op_type, pool, pg, wait_pg, dload, local_io, remote_io in ceph_ho_dumper.parse(fname):
-            yield osd_id, op_type, pool, pg, wait_pg, (-1 if dload is None else dload), \
-                  (-1 if local_io else local_io), (-1 if remote_io is None else remote_io)
-            count += 1
-            if limit and count == limit:
-                return
-            if count % 1000000 == 0:
-                print(f"Processed {count // 1000000} mlns of events")
+        with open(fname) as fd:
+            for *header, dload, local_io, remote_io in ceph_ho_dumper.parse(fd):
+                yield (*header, (-1 if dload is None else dload),
+                      (-1 if local_io else local_io), (-1 if remote_io is None else remote_io))
+                count += 1
+                if limit and count == limit:
+                    return
+                if count % 1000000 == 0:
+                    print(f"Processed {count // 1000000} mlns of events")
     print(f"Total {count} events")
 
 
