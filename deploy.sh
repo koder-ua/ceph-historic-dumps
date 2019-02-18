@@ -5,8 +5,8 @@ set -o errexit
 
 # CONFIGURABLE
 
-#COMPRESSOR="gzip -f -k"
-#EXT="gz"
+#readonly COMPRESSOR="gzip -f -k"
+#readonly EXT="gz"
 
 readonly COMPRESSOR="lzma -9 -z -k -f"
 readonly EXT="lzma"

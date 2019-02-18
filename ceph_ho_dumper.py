@@ -18,11 +18,21 @@ from struct import Struct
 MKS_TO_MS = 1000
 S_TO_MS = 1000
 
-MAX_TIME_VL = 100000
-MIN_TIME_VL = 1
-SCALE_COEF = 255 / (math.log10(MAX_TIME_VL) - math.log10(MIN_TIME_VL))
-assert MIN_TIME_VL == 1
+MAX_SRC_VL = 100000
+MIN_SRC_VL = 1
+MAX_TARGET_VL = 254
+MIN_TARGET_VL = 1
+TARGET_UNDERVAL = 0
+TARGET_OVERVAL = 255
+UNDISCRETIZE_UNDERVAL = 0
+UNDISCRETIZE_OVERVAL = MAX_SRC_VL
 
+assert MIN_SRC_VL >= 1
+assert MAX_SRC_VL > MIN_SRC_VL
+assert TARGET_OVERVAL > MAX_TARGET_VL > MIN_TARGET_VL > TARGET_UNDERVAL
+assert UNDISCRETIZE_UNDERVAL <= MIN_SRC_VL < MAX_SRC_VL <= UNDISCRETIZE_OVERVAL
+
+SCALE_COEF = (MAX_TARGET_VL - MIN_TARGET_VL) / (math.log10(MAX_SRC_VL) - math.log10(MIN_SRC_VL))
 
 OP_READ = 0
 OP_WRITE_PRIMARY = 1
@@ -39,16 +49,25 @@ class NoPoolFound(Exception):
 
 
 def discretize(vl):
-    if vl > MAX_TIME_VL:
-        vl = MAX_TIME_VL
+    if vl > MAX_SRC_VL:
+        return TARGET_OVERVAL
+    if vl < MIN_SRC_VL:
+        return TARGET_UNDERVAL
     assert vl >= 0
-    res = round(math.log10(vl + 1) * SCALE_COEF)
-    assert 255 >= res >= 0
+    res = round(math.log10(vl) * SCALE_COEF) + MIN_TARGET_VL
+    assert MAX_TARGET_VL >= res >= MIN_TARGET_VL
     return res
 
 
 def undiscretize(vl):
-    return 10.0 ** (vl / SCALE_COEF) - 1
+    if vl == TARGET_UNDERVAL:
+        return UNDISCRETIZE_UNDERVAL
+    if vl == TARGET_OVERVAL:
+        return UNDISCRETIZE_OVERVAL
+    return 10 ** ((vl - MIN_TARGET_VL) / SCALE_COEF)
+
+
+undiscretize_map = {vl: undiscretize(vl) for vl in range(256)}
 
 
 def to_unix_ms(dtm):
@@ -96,7 +115,7 @@ def get_timings(op):
         if evt.startswith("waiting for subops from"):
             replicas_waiting = tm
         elif evt.startswith("sub_op_commit_rec from"):
-            subop = tm
+            subop = max(tm, subop)
 
     op_duration = int(op['duration']) // MKS_TO_MS
     return op_duration, initiated_at, qpg_at, started, local_done, replicas_waiting, subop
@@ -200,7 +219,7 @@ def pack_to_str(op, pools_map):
     local_io = local_done - started
     assert local_io >= 0
 
-    duration = op['duration']
+    duration = op['duration'] * S_TO_MS
 
     if op_type in (OP_WRITE_PRIMARY, OP_WRITE_SECONDARY):
         dload = qpg_at
@@ -230,23 +249,27 @@ def pack_to_str(op, pools_map):
 
 
 def unpack_from_str(data, offset, pool_map):
+    undiscretize_l = undiscretize_map.__getitem__
     flags_and_pool = ord(data[offset])
     op_type = flags_and_pool >> 6
     pool = pool_map[flags_and_pool & 0x3F]
 
     if op_type == OP_WRITE_PRIMARY:
         _, pg, dura, wait_pg, dload, local_io, remote_io = OPRecortWP.unpack(data[offset: offset + OPRecortWP.size])
-        return op_type, pool, pg, undiscretize(dura), undiscretize(wait_pg), \
-               undiscretize(dload), undiscretize(local_io), undiscretize(remote_io), \
+        return op_type, pool, pg, undiscretize_l(dura), undiscretize_l(wait_pg), \
+               undiscretize_l(dload), undiscretize_l(local_io), undiscretize_l(remote_io), \
                offset + OPRecortWP.size
+
     if op_type == OP_WRITE_SECONDARY:
         _, pg, dura, wait_pg, dload, local_io = OPRecortWS.unpack(data[offset: offset + OPRecortWS.size])
-        return op_type, pool, pg, undiscretize(dura), undiscretize(wait_pg), \
-               undiscretize(dload), undiscretize(local_io), None, offset + OPRecortWS.size
+        return op_type, pool, pg, undiscretize_l(dura), undiscretize_l(wait_pg), \
+               undiscretize_l(dload), undiscretize_l(local_io), None, offset + OPRecortWS.size
+
     assert op_type == OP_READ
+
     _, pg, dura, wait_pg, local_io = OPRecortR.unpack(data[offset: offset + OPRecortR.size])
-    return op_type, pool, pg, undiscretize(dura), undiscretize(wait_pg), \
-           None, undiscretize(local_io), None, \
+    return op_type, pool, pg, undiscretize_l(dura), undiscretize_l(wait_pg), \
+           None, undiscretize_l(local_io), None, \
            offset + OPRecortR.size
 
 
@@ -408,22 +431,22 @@ def format_op(osd_id, op_type, pool_name, pg, dura, wait_pg, dload, local_io, re
         assert dload is not None
         assert local_io is not None
         assert remote_io is not None
-        return (("WRITE_PRIMARY   {:>15s}:{:<5x} osd_id={:>4d}   duration={:>5d}   wait_pg={:>5d}   dload={:>5d}" +
-                 "   local_io={:>5d}   remote_io={:>5d}").
+        return (("WRITE_PRIMARY     {:>25s}:{:<5x} osd_id={:>4d}   duration={:>5d}   wait_pg={:>5d}   local_io={:>5d}" +
+                 "   dload={:>5d}   remote_io={:>5d}").
                  format(pool_name, pg, osd_id, int(dura), int(wait_pg), int(dload), int(local_io), int(remote_io)))
     elif op_type == OP_WRITE_SECONDARY:
         assert wait_pg is not None
         assert dload is not None
         assert local_io is not None
         assert remote_io is None
-        return ("WRITE_SECONDARY {:>15s}:{:<5x} osd_id={:>4d}   duration={:>5d}   wait_pg={:>5d}   dload={:>5d}   local_io={:>5d}".
+        return ("WRITE_SECONDARY   {:>25s}:{:<5x} osd_id={:>4d}   duration={:>5d}   wait_pg={:>5d}   local_io={:>5d}   dload={:>5d}".
                 format(pool_name, pg, osd_id, int(dura), int(wait_pg), int(dload), int(local_io)))
     elif op_type == OP_READ:
         assert wait_pg is not None
         assert dload is None
         assert local_io is not None
         assert remote_io is None
-        return ("READ            {:>15s}:{:<5x} osd_id={:>4d}   duration={:>5d}   wait_pg={:>5d}   local_io={:>5d}".
+        return ("READ              {:>25s}:{:<5x} osd_id={:>4d}   duration={:>5d}   wait_pg={:>5d}   local_io={:>5d}".
                 format(pool_name, pg, osd_id, int(dura), int(wait_pg), int(local_io)))
     else:
         assert False, "Unknown op"
