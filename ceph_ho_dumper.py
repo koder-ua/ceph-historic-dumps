@@ -2,8 +2,10 @@
 import errno
 import threading
 
-import math
+import os
 import sys
+import math
+import stat
 import json
 import time
 import struct
@@ -335,6 +337,7 @@ def open_to_append(fname, is_bin=False):
         fd.seek(0, os.SEEK_END)
     else:
         fd = open(fname, "wb" if is_bin else "w")
+        os.chmod(fname, stat.S_IRGRP | stat.S_IRUSR | stat.S_IWUSR | stat.S_IROTH)
     return fd
 
 

@@ -8,10 +8,10 @@ set -o errexit
 #readonly COMPRESSOR="gzip -f -k"
 #readonly EXT="gz"
 
-readonly COMPRESSOR="lzma -9 -z -k -f"
+readonly COMPRESSOR="lzma --memlimit-compress=1GiB --best --compress --force"
 readonly EXT="lzma"
 
-readonly RECORD_DURATION=60
+readonly RECORD_DURATION=5
 readonly RECORD_SIZE=100
 
 readonly ALL_NODES="ceph01 ceph02 ceph03"
@@ -24,12 +24,15 @@ readonly ALL_NODES="ceph01 ceph02 ceph03"
 
 readonly BIN=ceph_ho_dumper.py
 readonly TARGET="/tmp/${BIN}"
+readonly SHELL="/bin/bash"
 readonly LOG=/tmp/ceph_ho_dumper.log
 readonly RESULT=/tmp/historic_ops_dump.bin
 readonly SRV_FILE=mira-ceph-ho-dumper.service
 
 # CONSTANTS
-
+readonly TARGET_USER="ceph"
+readonly TARGET_USER_GRP="ceph.ceph"
+readonly FILE_MODE=644
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly NC='\033[0m' # No Color
@@ -39,6 +42,11 @@ readonly DEFAULT_DURATION=600
 readonly SSH_CMD="ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 readonly SCP_CMD="scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 readonly SERVICE="${SRV_FILE}"
+
+readonly _RES_DIR=$(dirname "${RESULT}")
+readonly _RES_BASE=$(basename "${RESULT}")
+readonly COPY_RESULT="${_RES_DIR}/copy_${_RES_BASE}"
+
 readonly SRV_FILE_DST_PATH="/lib/systemd/system/${SRV_FILE}"
 readonly DEFAULT_JOBS=$(echo "${ALL_NODES}" | wc --words)
 
@@ -47,14 +55,14 @@ function do_ssh {
     local node="${1}"
     local cmd="${2}"
     set -x
-    echo "${cmd}" | ${SSH_CMD} "${node}" -- sudo bash
+    echo "${cmd}" | ${SSH_CMD} "${node}" -- bash
     { set +x ; } 2>/dev/null
 }
 
 function do_ssh_out {
     local node="${1}"
     local cmd="${2}"
-    echo "${cmd}" | ${SSH_CMD} "${node}" -- sudo bash
+    echo "${cmd}" | ${SSH_CMD} "${node}" -- bash
 }
 
 function do_scp {
@@ -69,10 +77,11 @@ function clean {
     local nodes="${1}"
     local cmd
     for node in ${nodes} ; do
-        cmd="systemctl stop ${SERVICE} ; "
-        cmd+="systemctl disable ${SERVICE} ; "
-        cmd+="${TARGET} set --duration=${DEFAULT_DURATION} --count=${DEFAULT_COUNT} >/dev/null 2>&1 ; "
-        cmd+="rm -f ${SRV_FILE_DST_PATH} ${TARGET} ${LOG} ${RESULT} || true"
+        cmd="sudo systemctl stop ${SERVICE} ; "
+        cmd+="sudo systemctl disable ${SERVICE} ; "
+        cmd+="sudo su ${TARGET_USER} -s ${SHELL} -c '${TARGET} set --duration=${DEFAULT_DURATION} --count=${DEFAULT_COUNT} >/dev/null 2>&1' ; "
+        cmd+="sudo su ${TARGET_USER} -s ${SHELL} -c 'rm --force ${TARGET} ${LOG} ${RESULT}' ;"
+        cmd+="sudo rm --force ${SRV_FILE_DST_PATH} || true"
         do_ssh "${node}" "${cmd}"
     done
 }
@@ -82,7 +91,7 @@ function update_bin {
     for node in ${nodes} ; do
         do_ssh "${node}" "sudo systemctl stop ${SERVICE}"
         do_scp "${BIN}" "${node}:${TARGET}"
-        do_ssh "${node}" "chown root.root ${TARGET} && chmod +x ${TARGET} && sudo systemctl start ${SERVICE}"
+        do_ssh "${node}" "sudo chown ${TARGET_USER_GRP} ${TARGET} && chmod ${FILE_MODE} ${TARGET} && sudo systemctl start ${SERVICE}"
     done
 }
 
@@ -96,17 +105,19 @@ function deploy {
         srv_file=$(sed --expression "s/{DURATION}/${RECORD_DURATION}/" \
                        --expression "s/{SIZE}/${RECORD_SIZE}/" \
                        --expression "s/{LOG_FILE}/${LOG//\//\\/}/" \
+                       --expression "s/{USER}/${TARGET_USER}/" \
                        --expression "s/{RESULT}/${RESULT//\//\\/}/" < "${SRV_FILE}")
 
         echo "${srv_file}" | ${SSH_CMD} "${node}" "cat > /tmp/${SRV_FILE}"
 
-        cmd="chown root.root ${TARGET} && "
-        cmd+="chmod +x ${TARGET} && "
-        cmd+="mv /tmp/${SRV_FILE} ${SRV_FILE_DST_PATH} &&"
-        cmd+="chown root.root ${SRV_FILE_DST_PATH} && "
-        cmd+="systemctl daemon-reload && "
-        cmd+="systemctl enable ${SERVICE} && "
-        cmd+="systemctl start ${SERVICE}"
+        cmd="sudo chown ${TARGET_USER_GRP} ${TARGET} && "
+        cmd+="sudo su ${TARGET_USER} -s ${SHELL} -c 'chmod ${FILE_MODE} ${TARGET}' && "
+        cmd+="sudo mv /tmp/${SRV_FILE} ${SRV_FILE_DST_PATH} && "
+        cmd+="sudo chown root.root ${SRV_FILE_DST_PATH} && "
+        cmd+="sudo chmod 644 ${SRV_FILE_DST_PATH} && "
+        cmd+="sudo systemctl daemon-reload && "
+        cmd+="sudo systemctl enable ${SERVICE} && "
+        cmd+="sudo systemctl start ${SERVICE}"
 
         do_ssh "${node}" "${cmd}"
     done
@@ -117,10 +128,11 @@ function show {
     local srv_stat
     local log_file_ll
     local log_size
+    local pid
 
     for node in ${nodes} ; do
 
-        srv_stat=$(do_ssh_out "${node}" "sudo systemctl status ${SERVICE}" | grep Active || true)
+        srv_stat=$(do_ssh_out "${node}" "systemctl status ${SERVICE}" | grep Active || true)
         log_file_ll=$(do_ssh_out "${node}" "ls -l ${RESULT}" 2>&1 || true)
 
         if [[ "${log_file_ll}" == *"No such file or directory"* ]] ; then
@@ -129,13 +141,15 @@ function show {
             log_size=$(echo "${log_file_ll}" | awk '{print $5}' | numfmt --to=iec-i --suffix=B)
         fi
 
+        pid=$(do_ssh_out "${node}" "systemctl --property=MainPID show ${SERVICE}")
+
         if [[ "${srv_stat}" == *" inactive "* ]] ; then
             printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${RED}" "${srv_stat}" "${NC}" "${log_size}"
         else
             if [[ "${srv_stat}" == *" failed "* ]] ; then
                 printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${RED}" "${srv_stat}" "${NC}" "${log_size}"
             else
-                printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${GREEN}" "${srv_stat}" "${NC}" "${log_size}"
+                printf "%-20s : %b %s %b pid = %s  data_sz = %s\n" "${node}" "${GREEN}" "${srv_stat}" "${NC}" "${pid:8}" "${log_size}"
             fi
         fi
     done
@@ -170,9 +184,9 @@ function collect_one {
     local rbn
 
     rbn="$(basename "${RESULT}")"
-    do_ssh "${node}" "sudo ${COMPRESSOR} ${RESULT}"
-    do_scp "${node}:${RESULT}.${EXT}" "${node}-${rbn}.${EXT}"
-    do_ssh "${node}" "sudo rm --force ${RESULT}.${EXT}"
+    do_ssh "${node}" "rm --force ${COPY_RESULT} ; cp ${RESULT} ${COPY_RESULT} ; ${COMPRESSOR} ${COPY_RESULT}"
+    do_scp "${node}:${COPY_RESULT}.${EXT}" "${node}-${rbn}.${EXT}"
+    do_ssh "${node}" "rm --force ${COPY_RESULT}.${EXT}"
 }
 
 function collect {

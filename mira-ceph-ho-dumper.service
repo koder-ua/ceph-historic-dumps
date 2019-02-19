@@ -3,8 +3,10 @@ Description=Mirantis ceph historic ops dumper
 After=multi-user.target
 
 [Service]
-Type=idle
-ExecStart=/tmp/ceph_ho_dumper.py record --duration={DURATION} --size={SIZE} --log={LOG_FILE} {RESULT}
+Environment=PYTHONUNBUFFERED=1
+Type=simple
+User={USER}
+ExecStart=/usr/bin/python2 /tmp/ceph_ho_dumper.py record --duration={DURATION} --size={SIZE} --log={LOG_FILE} {RESULT}
 StandardOutput=null
 
 [Install]
