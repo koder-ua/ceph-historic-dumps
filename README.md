@@ -6,6 +6,8 @@ How to use:
     * You need user with passwordless ssh to all required osd nodes and with passwordless sudo on them
     * Run 'git clone https://github.com/koder-ua/ceph-historic-dumps.git' on any node,
       which has an access to all osd nodes
+    * cd ceph-historic-dumps
+    * git checkout stable
     * edit deploy.sh - replace line
         readonly ALL_NODES="ceph01 ceph02 ceph03"
       with list of all required osd node names
