@@ -26,6 +26,8 @@ MAX_TARGET_VL = 254
 MIN_TARGET_VL = 1
 TARGET_UNDERVAL = 0
 TARGET_OVERVAL = 255
+MAX_PG_VAL=(2 ** 16 - 1)
+MAX_POOL_VAL=63
 UNDISCRETIZE_UNDERVAL = 0
 UNDISCRETIZE_OVERVAL = MAX_SRC_VL
 
@@ -210,8 +212,10 @@ def pack_to_str(op, pools_map):
     except KeyError:
         raise NoPoolFound()
 
-    assert 0 <= pool_log_id < 64
-    assert pg < 2 ** 16
+    assert 0 <= pool_log_id <= MAX_POOL_VAL
+
+    # overflow pg
+    pg = min(MAX_PG_VAL, pg)
 
     _, _, qpg_at, started, local_done, replicas_waiting, subop = get_timings(op)
     flags_and_pool = (op_type << 6) + pool_log_id
@@ -349,9 +353,12 @@ def dump_loop(opts, osd_ids, fd):
     # spawn pipe listen thread
     import Queue
     cmd_q = Queue.Queue()
-    th = threading.Thread(target=pipe_thread, args=(cmd_q,))
-    th.daemon = True
-    th.start()
+    if opts.pipe:
+        th = threading.Thread(target=pipe_thread, args=(cmd_q,))
+        th.daemon = True
+        th.start()
+    else:
+        th = None
 
     while True:
         start_time = time.time()
@@ -467,6 +474,7 @@ def parse_args(argv):
     set_parser.add_argument("--duration", required=True, type=int, help="Duration to keep")
     set_parser.add_argument("--size", required=True, type=int, help="Num request to keep")
     set_parser.add_argument("--log", required=True, help="File to log messages to")
+    set_parser.add_argument("--pipe", action='store_true', help="Create communication pipe")
     set_parser.add_argument("output_file", help="Filename to append requests logs to it")
 
     set_parser = subparsers.add_parser('parse', help="Parse records from file")

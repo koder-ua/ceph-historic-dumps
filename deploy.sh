@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
 set -o nounset
-set -o pipefail
-set -o errexit
 
 # CONFIGURABLE
 
 #readonly COMPRESSOR="gzip -f -k"
 #readonly EXT="gz"
 
-readonly COMPRESSOR="lzma --memlimit-compress=1GiB --best --compress --force"
+readonly COMPRESSOR="lzma --memlimit-compress=1GiB --best --compress --force --keep"
 readonly EXT="lzma"
 
-readonly RECORD_DURATION=5
+readonly RECORD_DURATION=60
 readonly RECORD_SIZE=100
 
 readonly ALL_NODES="ceph01 ceph02 ceph03"
@@ -21,7 +19,6 @@ readonly ALL_NODES="ceph01 ceph02 ceph03"
 #readonly ALL_NODES="$ALL_NODES1 ceph30 ceph31 ceph32 ceph33 ceph34 ceph35 ceph36 ceph38 ceph39 ceph40 ceph41 ceph42"
 
 # ALMOST CONSTANT
-
 readonly BIN=ceph_ho_dumper.py
 readonly TARGET="/tmp/${BIN}"
 readonly SHELL="/bin/bash"
@@ -31,16 +28,17 @@ readonly SRV_FILE=mira-ceph-ho-dumper.service
 
 # CONSTANTS
 readonly TARGET_USER="ceph"
-readonly TARGET_USER_GRP="ceph.ceph"
+readonly TARGET_USER_GRP="${TARGET_USER}.${TARGET_USER}"
 readonly FILE_MODE=644
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
-readonly NC='\033[0m' # No Color
+readonly NO_COLOR='\033[0m'
 
 readonly DEFAULT_COUNT=20
 readonly DEFAULT_DURATION=600
-readonly SSH_CMD="ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-readonly SCP_CMD="scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+readonly SSH_OPTS="-q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectionAttempts=3 -o ConnectTimeout=15"
+readonly SSH_CMD="ssh ${SSH_OPTS} "
+readonly SCP_CMD="scp ${SSH_OPTS} "
 readonly SERVICE="${SRV_FILE}"
 
 readonly _RES_DIR=$(dirname "${RESULT}")
@@ -52,46 +50,75 @@ readonly DEFAULT_JOBS=$(echo "${ALL_NODES}" | wc --words)
 
 
 function do_ssh {
+    local run_shell="sudo su ${TARGET_USER} -s '${SHELL}'"
+    local use_sudo=0
+    local silent=0
+    local lint_fake
+
+    if [[ "${1}" == "--silent" ]] ; then
+        silent=1
+        lint_fake="${3}"
+        shift
+    fi
+
+    if [[ "${1}" == "--sudo" ]] ; then
+        run_shell="sudo bash"
+        use_sudo=1
+        lint_fake="${3}"
+        shift
+    fi
+
     local node="${1}"
     local cmd="${2}"
-    set -x
-    echo "${cmd}" | ${SSH_CMD} "${node}" -- bash
-    { set +x ; } 2>/dev/null
+
+    if [[ "${silent}" == "0" ]] ; then
+        if [[ "${use_sudo}" == "1" ]] ; then
+            echo "${node}: SUDO: ${cmd}"
+        else
+            echo "${node}: ${cmd}"
+        fi
+    fi
+
+    echo "${cmd}" | ${SSH_CMD} "${node}" -- "${run_shell}"
+}
+
+function do_ssh_sudo {
+    do_ssh --sudo "${1}" "${2}"
 }
 
 function do_ssh_out {
-    local node="${1}"
-    local cmd="${2}"
-    echo "${cmd}" | ${SSH_CMD} "${node}" -- bash
+    do_ssh --silent "${1}" "${2}"
 }
+
 
 function do_scp {
     local source="${1}"
     local target="${2}"
-    set -x
+    echo "${source} => ${target}"
     ${SCP_CMD} "${source}" "${target}"
-    { set +x ; } 2>/dev/null
 }
 
 function clean {
     local nodes="${1}"
     local cmd
     for node in ${nodes} ; do
-        cmd="sudo systemctl stop ${SERVICE} ; "
-        cmd+="sudo systemctl disable ${SERVICE} ; "
-        cmd+="sudo su ${TARGET_USER} -s ${SHELL} -c '${TARGET} set --duration=${DEFAULT_DURATION} --count=${DEFAULT_COUNT} >/dev/null 2>&1' ; "
-        cmd+="sudo su ${TARGET_USER} -s ${SHELL} -c 'rm --force ${TARGET} ${LOG} ${RESULT}' ;"
-        cmd+="sudo rm --force ${SRV_FILE_DST_PATH} || true"
+        cmd="systemctl stop ${SERVICE} ; systemctl disable ${SERVICE} ; rm --force '${SRV_FILE_DST_PATH}' || true"
+        do_ssh_sudo "${node}" "${cmd}"
+
+        cmd="${TARGET} set --duration=${DEFAULT_DURATION} --count=${DEFAULT_COUNT} >/dev/null 2>&1 ; "
+        cmd+="rm --force '${TARGET}' '${LOG}' '${RESULT}' || true"
         do_ssh "${node}" "${cmd}"
     done
 }
 
 function update_bin {
     local nodes="${1}"
+    local cmd
     for node in ${nodes} ; do
-        do_ssh "${node}" "sudo systemctl stop ${SERVICE}"
         do_scp "${BIN}" "${node}:${TARGET}"
-        do_ssh "${node}" "sudo chown ${TARGET_USER_GRP} ${TARGET} && chmod ${FILE_MODE} ${TARGET} && sudo systemctl start ${SERVICE}"
+        cmd="systemctl stop ${SERVICE} || true && chown ${TARGET_USER_GRP} ${TARGET} && "
+        cmd+="chmod ${FILE_MODE} '${TARGET}' && systemctl start ${SERVICE}"
+        do_ssh_sudo "${node}" "${cmd}"
     done
 }
 
@@ -110,16 +137,16 @@ function deploy {
 
         echo "${srv_file}" | ${SSH_CMD} "${node}" "cat > /tmp/${SRV_FILE}"
 
-        cmd="sudo chown ${TARGET_USER_GRP} ${TARGET} && "
-        cmd+="sudo su ${TARGET_USER} -s ${SHELL} -c 'chmod ${FILE_MODE} ${TARGET}' && "
-        cmd+="sudo mv /tmp/${SRV_FILE} ${SRV_FILE_DST_PATH} && "
-        cmd+="sudo chown root.root ${SRV_FILE_DST_PATH} && "
-        cmd+="sudo chmod 644 ${SRV_FILE_DST_PATH} && "
-        cmd+="sudo systemctl daemon-reload && "
-        cmd+="sudo systemctl enable ${SERVICE} && "
-        cmd+="sudo systemctl start ${SERVICE}"
+        cmd="chown ${TARGET_USER_GRP} '${TARGET}' && "
+        cmd+="chmod ${FILE_MODE} '${TARGET}' && "
+        cmd+="mv '/tmp/${SRV_FILE}' '${SRV_FILE_DST_PATH}' && "
+        cmd+="chown root.root '${SRV_FILE_DST_PATH}' && "
+        cmd+="chmod 644 '${SRV_FILE_DST_PATH}' && "
+        cmd+="systemctl daemon-reload && "
+        cmd+="systemctl enable ${SERVICE} && "
+        cmd+="systemctl start ${SERVICE}"
 
-        do_ssh "${node}" "${cmd}"
+        do_ssh_sudo "${node}" "${cmd}"
     done
 }
 
@@ -132,8 +159,8 @@ function show {
 
     for node in ${nodes} ; do
 
-        srv_stat=$(do_ssh_out "${node}" "systemctl status ${SERVICE}" | grep Active || true)
-        log_file_ll=$(do_ssh_out "${node}" "ls -l ${RESULT}" 2>&1 || true)
+        srv_stat=$(do_ssh_out "${node}" "systemctl status ${SERVICE} | grep Active || true")
+        log_file_ll=$(do_ssh_out "${node}" "ls -l '${RESULT}' 2>&1 || true")
 
         if [[ "${log_file_ll}" == *"No such file or directory"* ]] ; then
             log_size="NO FILE"
@@ -144,12 +171,13 @@ function show {
         pid=$(do_ssh_out "${node}" "systemctl --property=MainPID show ${SERVICE}")
 
         if [[ "${srv_stat}" == *" inactive "* ]] ; then
-            printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${RED}" "${srv_stat}" "${NC}" "${log_size}"
+            printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${RED}" "${srv_stat}" "${NO_COLOR}" "${log_size}"
         else
             if [[ "${srv_stat}" == *" failed "* ]] ; then
-                printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${RED}" "${srv_stat}" "${NC}" "${log_size}"
+                printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${RED}" "${srv_stat}" "${NO_COLOR}" "${log_size}"
             else
-                printf "%-20s : %b %s %b pid = %s  data_sz = %s\n" "${node}" "${GREEN}" "${srv_stat}" "${NC}" "${pid:8}" "${log_size}"
+                printf "%-20s : %b %s %b pid = %s  data_sz = %s\n" \
+                       "${node}" "${GREEN}" "${srv_stat}" "${NO_COLOR}" "${pid:8}" "${log_size}"
             fi
         fi
     done
@@ -158,7 +186,7 @@ function show {
 function stop {
     local nodes="${1}"
     for node in ${nodes} ; do
-        do_ssh "${node}" "sudo systemctl stop ${SERVICE}"
+        do_ssh_sudo "${node}" "systemctl stop ${SERVICE}"
     done
 }
 
@@ -167,7 +195,7 @@ function tails {
     local tsize="${2}"
     for node in ${nodes} ; do
         echo "${node}"
-        $SSH_CMD "${node}" -- "tail --lines ${tsize} \"${LOG}\""
+        do_ssh "${node}" -- "tail --lines ${tsize} '${LOG}'"
         echo
     done
 }
@@ -184,9 +212,9 @@ function collect_one {
     local rbn
 
     rbn="$(basename "${RESULT}")"
-    do_ssh "${node}" "rm --force ${COPY_RESULT} ; cp ${RESULT} ${COPY_RESULT} ; ${COMPRESSOR} ${COPY_RESULT}"
-    do_scp "${node}:${COPY_RESULT}.${EXT}" "${node}-${rbn}.${EXT}"
-    do_ssh "${node}" "rm --force ${COPY_RESULT}.${EXT}"
+    do_ssh "${node}" "${COMPRESSOR} '${RESULT}'"
+    do_scp "${node}:${RESULT}.${EXT}" "${node}-${rbn}.${EXT}"
+    do_ssh "${node}" "rm --force '${RESULT}.${EXT}'"
 }
 
 function collect {
@@ -315,4 +343,15 @@ function main {
     esac
 }
 
-main "$@"
+(
+    set -o pipefail
+    set -o errexit
+    main "$@"
+)
+
+readonly exit_code="$?"
+
+if [[ "${exit_code}" != 0 ]] ; then
+    printf "%bFAILED!%b\n" "${RED}" "${NO_COLOR}" 2>&1
+    exit "${exit_code}"
+fi
