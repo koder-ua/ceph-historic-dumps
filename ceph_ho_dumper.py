@@ -1,5 +1,9 @@
 #!/usr/bin/env python2
+from __future__ import print_function
+
+import bz2
 import errno
+import heapq
 import threading
 
 import os
@@ -45,7 +49,13 @@ OP_WRITE_SECONDARY = 2
 
 OPS_RECORD_ID = 1
 POOLS_RECORD_ID = 2
-HEADER = b"OSD OPS LOG v1\0"
+CLUSTER_INFO_ID = 3
+
+
+HEADER = b"OSD OPS LOG v1.1\0"
+
+
+IS_PY3 = sys.version_info > (3,)
 
 
 class NoPoolFound(Exception):
@@ -256,7 +266,7 @@ def pack_to_str(op, pools_map):
 
 def unpack_from_str(data, offset, pool_map):
     undiscretize_l = undiscretize_map.__getitem__
-    flags_and_pool = ord(data[offset])
+    flags_and_pool = data[offset] if IS_PY3 else ord(data[offset])
     op_type = flags_and_pool >> 6
     pool = pool_map[flags_and_pool & 0x3F]
 
@@ -345,6 +355,49 @@ def open_to_append(fname, is_bin=False):
     return fd
 
 
+RADOS_DF = 'rados df -f json'
+PG_DUMP = 'ceph pg dump -f json'
+CEPH_DF = 'ceph df -f json'
+CEPH_S = 'ceph -s -f json'
+
+
+def cluster_record_thread(commands, res_queue):
+    ctime = time.time()
+    heap = [(ctime, cmds) for cmds in commands]
+    heapq.heapify(heap)
+    while True:
+        stime = heap[0][0] - time.time()
+        if stime > 0:
+            time.sleep(stime)
+
+        _, cmds = heapq.heappop(heap)
+        data = dump_cluster_info(cmds)
+        ctime = time.time()
+        res_queue.put(struct.pack("!HLL", POOLS_RECORD_ID, int(ctime), len(data)) + data)
+        heapq.heappush(heap, (ctime + commands[cmds], cmds))
+
+
+
+START this func in new thread from main thread directly for each record
+start them also for SIGUSR1
+how to guarantee that file would not be corrupted in case of daemon stopped during record
+при старте сканировать файл до конца последней полной записи
+при парсинге игнорировать частичную запись
+
+
+def dump_cluster_info(commands):
+    output = ""
+    for cmd in commands:
+        print("Collect cmd", cmd)
+        try:
+            curr_output = subprocess.check_output(cmd, shell=True)
+            output += "{} {}\n{}".format(cmd, len(curr_output), curr_output)
+        except subprocess.CalledProcessError:
+            pass
+
+    return bz2.compress(output)
+
+
 def dump_loop(opts, osd_ids, fd):
     packer = OPPacker()
     not_inited_osd = osd_ids.copy()
@@ -352,13 +405,19 @@ def dump_loop(opts, osd_ids, fd):
 
     # spawn pipe listen thread
     import Queue
-    cmd_q = Queue.Queue()
-    if opts.pipe:
-        th = threading.Thread(target=pipe_thread, args=(cmd_q,))
+    info_q = Queue.Queue()
+
+    cmds = {}
+    if opts.record_cluster != 0:
+        cmds[(RADOS_DF, CEPH_DF, CEPH_S)] = opts.record_cluster
+
+    if opts.pg_dump_timeout != 0:
+        cmds[(PG_DUMP,)] = opts.pg_dump_timeout
+
+    if cmds:
+        th = threading.Thread(target=cluster_record_thread, args=(cmds, info_q))
         th.daemon = True
         th.start()
-    else:
-        th = None
 
     while True:
         start_time = time.time()
@@ -395,10 +454,10 @@ def dump_loop(opts, osd_ids, fd):
                 stime = 0
 
             try:
-                cmd = cmd_q.get(True, stime)
+                fd.write(info_q.get(True, stime))
+                fd.flush()
             except Queue.Empty:
                 break
-
 
 
 class UnexpectedEndOfFile(Exception): pass
@@ -424,6 +483,10 @@ def parse(fd):
             sz, = struct.unpack("!H", get_bytes(fd, 2))
             pools_map = {pool_id: (name, orig_id_s)
                          for orig_id_s, (name, pool_id) in json.loads(get_bytes(fd, sz)).items()}
+        elif rec_type == CLUSTER_INFO_ID:
+            _, size = get_bytes(fd, struct.calcsize("!LL"))
+            data = bz2.decompress(get_bytes(fd, size))
+            print("get cluster info rec, size {} bytes".format(len(data)))
         else:
             assert rec_type == OPS_RECORD_ID, "File corrupted near offset {}".format(fd.tell())
             osd_id, recsize, _ = struct.unpack("!HHI", get_bytes(fd, 8))
@@ -474,7 +537,10 @@ def parse_args(argv):
     set_parser.add_argument("--duration", required=True, type=int, help="Duration to keep")
     set_parser.add_argument("--size", required=True, type=int, help="Num request to keep")
     set_parser.add_argument("--log", required=True, help="File to log messages to")
-    set_parser.add_argument("--pipe", action='store_true', help="Create communication pipe")
+    set_parser.add_argument("--record-cluster", type=int, help="Record cluster info every SECONDS seconds",
+                            metavar='SECONDS', default=0)
+    set_parser.add_argument("--pg-dump-timeout", type=int, help="Record cluster pg dump info every SECONDS seconds",
+                            metavar='SECONDS', default=0)
     set_parser.add_argument("output_file", help="Filename to append requests logs to it")
 
     set_parser = subparsers.add_parser('parse', help="Parse records from file")
@@ -527,6 +593,7 @@ def main(argv):
         log_file_fd.write(traceback.format_exc() + "\n")
         log_file_fd.flush()
         raise
+
 
 if __name__ == "__main__":
     exit(main(sys.argv))

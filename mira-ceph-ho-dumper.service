@@ -6,7 +6,7 @@ After=multi-user.target
 Environment=PYTHONUNBUFFERED=1
 Type=simple
 User={USER}
-ExecStart=/usr/bin/python2 /tmp/ceph_ho_dumper.py record --duration={DURATION} --size={SIZE} --log={LOG_FILE} {RESULT}
+ExecStart=/usr/bin/python2 /tmp/ceph_ho_dumper.py record --duration={DURATION} --size={SIZE} --log={LOG_FILE} {PRIMARY} {RESULT}
 StandardOutput=null
 
 [Install]

@@ -294,10 +294,9 @@ def parse_logs_info_PD(ops_iterator: Iterable[Tuple[int, ...]]) -> pandas.DataFr
     wait_for_pg = []
     dloads = []
 
-    for osd_id, op_type, pool, pg, duration, wait_pg, dload, local_io, remote_io in ops_iterator:
+    for osd_id, op_type, (_, pool_id), pg, duration, wait_pg, dload, local_io, remote_io in ops_iterator:
         assert op_type in (ceph_ho_dumper.OP_WRITE_PRIMARY, ceph_ho_dumper.OP_WRITE_SECONDARY, ceph_ho_dumper.OP_READ)
-        # duration = (dload if dload != -1 else 0) + wait_pg + max(local_io, remote_io)
-        pools.append(pool)
+        pools.append(pool_id)
         pgs.append(pg)
         osd_ids.append(osd_id)
         durations.append(duration)
@@ -322,7 +321,7 @@ def iterate_op_records(fnames: List[str], limit: int = None) -> Iterator[Tuple[i
     count = 0
     for fname in fnames:
         print(f"Start processing {fname}")
-        with open(fname) as fd:
+        with open(fname, 'rb') as fd:
             for *header, dload, local_io, remote_io in ceph_ho_dumper.parse(fd):
                 yield (*header, (-1 if dload is None else dload),
                       (-1 if local_io else local_io), (-1 if remote_io is None else remote_io))
@@ -338,7 +337,6 @@ def convert_to_hdfs(hdf5_target: str, fnames: List[str]):
     df = parse_logs_info_PD(iterate_op_records(fnames))
     with pandas.HDFStore(hdf5_target) as fd:
         fd['load'] = df
-    print(len(df))
 
 
 def load_hdf(fname: str) -> pandas.DataFrame:
@@ -410,13 +408,14 @@ def analyze_pgs(pg1_path: str, pg2_path: str):
 
 
 def main(argv):
-    convert_to_hdfs(argv[1], argv[2:])
+    # convert_to_hdfs(argv[1], argv[2:])
+    # return
 
     # analyze_pgs(argv[1], argv[2])
 
     df = load_hdf(argv[1])
 
-    sata2_pools_s = (df.pool == 115) | (df.pool == 117)
+    # sata2_pools_s = (df.pool == 115) | (df.pool == 117)
     slow_req_s = df.duration > 100
     primary_writes_s = df.op_type == ceph_ho_dumper.OP_WRITE_PRIMARY
     secondary_writes_s = df.op_type == ceph_ho_dumper.OP_WRITE_SECONDARY
@@ -426,7 +425,7 @@ def main(argv):
     # show_histo(df)
     # top_slow_pgs(df)
     # top_slow_osds(df)
-    plot_stages_part_distribution(df, sata2_pools_s & (primary_writes_s | secondary_writes_s))
+    plot_stages_part_distribution(df, (primary_writes_s | secondary_writes_s))
     # plot_op_time_distribution(df, sata2_pools_s & primary_writes_s)
 
     # per_PG_OSD_stat(all_ops, pg_map)

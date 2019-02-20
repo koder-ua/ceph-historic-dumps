@@ -7,6 +7,7 @@ set -o nounset
 #readonly EXT="gz"
 
 readonly COMPRESSOR="lzma --memlimit-compress=1GiB --best --compress --force --keep"
+readonly PRIMARY_OPTS="--record-cluster 300 --pg-dump-timeout 1800"
 readonly EXT="lzma"
 
 readonly RECORD_DURATION=60
@@ -36,7 +37,7 @@ readonly NO_COLOR='\033[0m'
 
 readonly DEFAULT_COUNT=20
 readonly DEFAULT_DURATION=600
-readonly SSH_OPTS="-q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectionAttempts=3 -o ConnectTimeout=15"
+readonly SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectionAttempts=1 -o ConnectTimeout=5 -o LogLevel=ERROR"
 readonly SSH_CMD="ssh ${SSH_OPTS} "
 readonly SCP_CMD="scp ${SSH_OPTS} "
 readonly SERVICE="${SRV_FILE}"
@@ -102,7 +103,7 @@ function clean {
     local nodes="${1}"
     local cmd
     for node in ${nodes} ; do
-        cmd="systemctl stop ${SERVICE} ; systemctl disable ${SERVICE} ; rm --force '${SRV_FILE_DST_PATH}' || true"
+        cmd="systemctl stop ${SERVICE} ; systemctl disable ${SERVICE} ; rm --force '${SRV_FILE_DST_PATH}' ; systemctl daemon-reload || true"
         do_ssh_sudo "${node}" "${cmd}"
 
         cmd="${TARGET} set --duration=${DEFAULT_DURATION} --count=${DEFAULT_COUNT} >/dev/null 2>&1 ; "
@@ -126,11 +127,21 @@ function deploy {
     local nodes="${1}"
     local cmd
     local srv_file
+    local first_node=$(echo "${nodes}" | awk '{print $1}')
+    local popt
+
     for node in ${nodes} ; do
         do_scp "${BIN}" "${node}:${TARGET}"
 
+        if [[ "${node}" == "${first_node}" ]] ; then
+            popt="${PRIMARY_OPTS}"
+        else
+            popt=""
+        fi
+
         srv_file=$(sed --expression "s/{DURATION}/${RECORD_DURATION}/" \
                        --expression "s/{SIZE}/${RECORD_SIZE}/" \
+                       --expression "s/{PRIMARY}/${popt}/" \
                        --expression "s/{LOG_FILE}/${LOG//\//\\/}/" \
                        --expression "s/{USER}/${TARGET_USER}/" \
                        --expression "s/{RESULT}/${RESULT//\//\\/}/" < "${SRV_FILE}")
