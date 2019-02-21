@@ -7,10 +7,10 @@ set -o nounset
 #readonly EXT="gz"
 
 readonly COMPRESSOR="lzma --memlimit-compress=1GiB --best --compress --force --keep"
-readonly PRIMARY_OPTS="--record-cluster 300 --pg-dump-timeout 1800"
+readonly PRIMARY_OPTS="--record-cluster 300 --record-pg-dump 1800"
 readonly EXT="lzma"
 
-readonly RECORD_DURATION=60
+readonly RECORD_DURATION=5
 readonly RECORD_SIZE=100
 
 readonly ALL_NODES="ceph01 ceph02 ceph03"
@@ -20,6 +20,7 @@ readonly ALL_NODES="ceph01 ceph02 ceph03"
 #readonly ALL_NODES="$ALL_NODES1 ceph30 ceph31 ceph32 ceph33 ceph34 ceph35 ceph36 ceph38 ceph39 ceph40 ceph41 ceph42"
 
 # ALMOST CONSTANT
+readonly PYTHON="/usr/bin/python3.5"
 readonly BIN=ceph_ho_dumper.py
 readonly TARGET="/tmp/${BIN}"
 readonly SHELL="/bin/bash"
@@ -91,7 +92,6 @@ function do_ssh_out {
     do_ssh --silent "${1}" "${2}"
 }
 
-
 function do_scp {
     local source="${1}"
     local target="${2}"
@@ -102,14 +102,38 @@ function do_scp {
 function clean {
     local nodes="${1}"
     local cmd
+    local code=0
+    local set_code
+    local file_present
+
     for node in ${nodes} ; do
-        cmd="systemctl stop ${SERVICE} ; systemctl disable ${SERVICE} ; rm --force '${SRV_FILE_DST_PATH}' ; systemctl daemon-reload || true"
+        cmd="systemctl stop ${SERVICE} ; rm --force '${SRV_FILE_DST_PATH}' ; systemctl daemon-reload || true"
         do_ssh_sudo "${node}" "${cmd}"
 
-        cmd="${TARGET} set --duration=${DEFAULT_DURATION} --count=${DEFAULT_COUNT} >/dev/null 2>&1 ; "
-        cmd+="rm --force '${TARGET}' '${LOG}' '${RESULT}' || true"
-        do_ssh "${node}" "${cmd}"
+        srv_stat=$(do_ssh_out "${node}" "systemctl status '${SERVICE}' | grep Active || true")
+        if [[ "${srv_stat}" != *" inactive "* ]] ; then
+            printf "%bFailed to stop service on node %s%b\n" "${RED}" "${node}" "${NO_COLOR}"
+            code=1
+        fi
+
+        file_present=$(do_ssh_out "${node}" "ls '${TARGET}' 2>&1 || true")
+        if [[ "${file_present}" != *"No such file or directory"* ]] ; then
+            cmd="'${PYTHON}' '${TARGET}' set --duration ${DEFAULT_DURATION} --size ${DEFAULT_COUNT} >/dev/null 2>&1"
+            set +e
+            do_ssh "${node}" "${cmd}"
+            set_code="$?"
+            set -e
+            if [[ "${set_code}" != "0" ]] ; then
+                printf "%bFailed to set duration for node %s%b\n" "${RED}" "${node}" "${NO_COLOR}"
+                code="${set_code}"
+            fi
+        fi
+
+        do_ssh "${node}" "rm --force '${TARGET}' '${LOG}' '${RESULT}' || true"
     done
+    if [[ "$code" != "0" ]] ; then
+        exit "${code}"
+    fi
 }
 
 function update_bin {
@@ -117,7 +141,7 @@ function update_bin {
     local cmd
     for node in ${nodes} ; do
         do_scp "${BIN}" "${node}:${TARGET}"
-        cmd="systemctl stop ${SERVICE} || true && chown ${TARGET_USER_GRP} ${TARGET} && "
+        cmd="systemctl stop ${SERVICE} || true && chown ${TARGET_USER_GRP} '${TARGET}' && "
         cmd+="chmod ${FILE_MODE} '${TARGET}' && systemctl start ${SERVICE}"
         do_ssh_sudo "${node}" "${cmd}"
     done
@@ -142,6 +166,7 @@ function deploy {
         srv_file=$(sed --expression "s/{DURATION}/${RECORD_DURATION}/" \
                        --expression "s/{SIZE}/${RECORD_SIZE}/" \
                        --expression "s/{PRIMARY}/${popt}/" \
+                       --expression "s/{PYTHON}/${PYTHON//\//\\/}/" \
                        --expression "s/{LOG_FILE}/${LOG//\//\\/}/" \
                        --expression "s/{USER}/${TARGET_USER}/" \
                        --expression "s/{RESULT}/${RESULT//\//\\/}/" < "${SRV_FILE}")
@@ -153,9 +178,7 @@ function deploy {
         cmd+="mv '/tmp/${SRV_FILE}' '${SRV_FILE_DST_PATH}' && "
         cmd+="chown root.root '${SRV_FILE_DST_PATH}' && "
         cmd+="chmod 644 '${SRV_FILE_DST_PATH}' && "
-        cmd+="systemctl daemon-reload && "
-        cmd+="systemctl enable ${SERVICE} && "
-        cmd+="systemctl start ${SERVICE}"
+        cmd+="systemctl daemon-reload"
 
         do_ssh_sudo "${node}" "${cmd}"
     done
@@ -214,7 +237,7 @@ function tails {
 function start {
     local nodes="${1}"
     for node in ${nodes} ; do
-        do_ssh "${node}" "sudo systemctl start ${SERVICE}"
+        do_ssh_sudo "${node}" "systemctl start ${SERVICE}"
     done
 }
 
@@ -324,9 +347,13 @@ function main {
         ;;
     -r) clean "${ALL_NODES}"
         deploy "${ALL_NODES}"
+        start "${ALL_NODES}"
         show "${ALL_NODES}"
         ;;
     -d) deploy "${ALL_NODES}"
+        start "${ALL_NODES}"
+        ;;
+    -D) deploy "${ALL_NODES}"
         ;;
     -s) show "${ALL_NODES}"
         ;;
