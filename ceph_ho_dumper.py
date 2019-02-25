@@ -1,4 +1,5 @@
 #!/usr/bin/env python3.5
+import abc
 import logging
 import os
 import sys
@@ -10,7 +11,6 @@ import json
 import time
 import zlib
 import heapq
-import struct
 import socket
 import os.path
 import argparse
@@ -23,8 +23,8 @@ from functools import partial
 from collections import defaultdict
 
 from typing.io import BinaryIO, TextIO
-from typing import List, Dict, Tuple, Iterator, Any, Optional, Union, Callable, Set
-
+from typing import List, Dict, Tuple, Iterator, Any, Optional, Union, Callable, Set, Type, cast, NewType, NamedTuple, \
+    Iterable
 
 logger = logging.getLogger('ops dumper')
 
@@ -32,6 +32,9 @@ logger = logging.getLogger('ops dumper')
 
 MKS_TO_MS = 1000
 S_TO_MS = 1000
+
+DEFAULT_DURATION = 600
+DEFAULT_SIZE = 20
 
 MAX_SRC_VL = 100000
 MIN_SRC_VL = 1
@@ -52,22 +55,42 @@ assert UNDISCRETIZE_UNDERVAL <= MIN_SRC_VL < MAX_SRC_VL <= UNDISCRETIZE_OVERVAL
 SCALE_COEF = (MAX_TARGET_VL - MIN_TARGET_VL) / (math.log10(MAX_SRC_VL) - math.log10(MIN_SRC_VL))
 
 
-class OP(Enum):
-    READ = 0
-    WRITE_PRIMARY = 1
-    WRITE_SECONDARY = 2
+compress = bz2.compress
+decompress = bz2.decompress
 
 
-class REC_ID(Enum):
-    OPS = 1
-    POOLS = 2
-    CLUSTER_INFO = 3
+class OpType(Enum):
+    read = 0
+    write_primary = 1
+    write_secondary = 2
 
 
-HEADER = b"OSD OPS LOG v1.1\0"
+class RecId(Enum):
+    ops = 1
+    pools = 2
+    cluster_info = 3
+    params = 4
+
+
+HEADER_V11 = b"OSD OPS LOG v1.1\0"
+HEADER_V12 = b"OSD OPS LOG v1.2\0"
+HEADER_LAST = HEADER_V12
+HEADER_LAST_NAME = cast(bytes, HEADER_LAST[:-1]).decode("ascii")
+ALL_SUPPORTED_HEADERS = [HEADER_V11, HEADER_V12]
+assert HEADER_LAST in ALL_SUPPORTED_HEADERS
+HEADER_LEN = len(HEADER_LAST)
+assert all(len(hdr) == HEADER_LEN for hdr in ALL_SUPPORTED_HEADERS), "All headers must have the same size"
 
 
 class NoPoolFound(Exception):
+    pass
+
+
+class UnexpectedEOF(ValueError):
+    pass
+
+
+class UTExit(Exception):
     pass
 
 
@@ -100,201 +123,10 @@ def to_unix_ms(dtm: str) -> int:
     # "2019-02-03 20:53:47.429996"
     date, tm = dtm.split()
     y, m, d = date.split("-")
-    h, min, smks = tm.split(':')
+    h, minute, smks = tm.split(':')
     s, mks = smks.split(".")
-    dt = datetime.datetime(int(y), int(m), int(d), int(h), int(min), int(s))
+    dt = datetime.datetime(int(y), int(m), int(d), int(h), int(minute), int(s))
     return int(time.mktime(dt.timetuple()) * S_TO_MS) + int(mks) // MKS_TO_MS
-
-
-# --------- CEPH UTILS -------------------------------------------------------------------------------------------------
-
-
-def get_timings(op: Dict[str, Any]) -> Tuple[int, int, int, int, int, int, int]:
-    initiated_at = to_unix_ms(op['initiated_at'])
-    stages = {evt["event"]: to_unix_ms(evt["time"]) - initiated_at
-              for evt in op["type_data"]["events"] if evt["event"] != "initiated"}
-
-    qpg_at = stages.get("queued_for_pg", -1)
-
-    try:
-        started = stages["started"]
-    except KeyError:
-        started = stages.get("reached_pg", -1)
-
-    try:
-        local_done = stages["op_applied"] if 'op_applied' in stages else stages["done"]
-    except KeyError:
-        local_done = -1
-
-    replicas_waiting = -1
-    subop = -1
-    for evt, tm in stages.items():
-        if evt.startswith("waiting for subops from"):
-            replicas_waiting = tm
-        elif evt.startswith("sub_op_commit_rec from"):
-            subop = max(tm, subop)
-
-    op_duration = int(op['duration']) // MKS_TO_MS
-    return op_duration, initiated_at, qpg_at, started, local_done, replicas_waiting, subop
-
-
-def get_ids(expected_class: str = None) -> Set[int]:
-    hostname = socket.gethostname()
-    osds = set()
-    in_host = False
-
-    for line in subprocess.check_output("ceph osd tree".split()).decode("utf8").split("\n"):
-        if 'host ' + hostname in line:
-            in_host = True
-            continue
-        if in_host and ' host ' in line:
-            break
-
-        if in_host and line.strip():
-            osd_id, maybe_class = line.split()[:2]
-            try:
-                float(maybe_class)
-                maybe_class = None
-            except ValueError:
-                pass
-
-            if expected_class and expected_class != maybe_class:
-                continue
-
-            osds.add(int(osd_id))
-
-    return osds
-
-
-def set_size_duration(osd_ids: Set[int], size: int, duration: int) -> Set[int]:
-    not_inited_osd = set()
-    for osd_id in osd_ids:
-        try:
-            cmd = "ceph daemon osd.{} config set osd_op_history_duration {}"
-            out = subprocess.check_output(cmd.format(osd_id, duration).split(), stderr=subprocess.STDOUT).decode("utf8")
-            assert "success" in out
-            cmd = "ceph daemon osd.{} config set osd_op_history_size {}"
-            out = subprocess.check_output(cmd.format(osd_id, size).split(), stderr=subprocess.STDOUT).decode("utf8")
-            assert "success" in out
-        except subprocess.CalledProcessError:
-            not_inited_osd.add(osd_id)
-    return not_inited_osd
-
-
-def get_type(op: Dict[str, Any]) -> Optional[OP]:
-    description = op['description']
-    op_type_s, _ = description.split("(", 1)
-
-    is_read = is_write = False
-
-    if '+write+' in description:
-        is_write = True
-    elif '+read+' in description:
-        is_read = True
-
-    if op_type_s == 'osd_op':
-        if is_write:
-            return OP.WRITE_PRIMARY
-        if is_read:
-            return OP.READ
-    elif op_type_s == 'osd_repop':
-        assert not (is_read or is_write)
-        return OP.WRITE_SECONDARY
-    return None
-
-
-def get_pool_pg(op: Dict[str, Any]):
-    pool_s, pg_s = op['description'].split()[1].split(".")
-    return int(pool_s), int(pg_s, 16)
-
-
-OPRecortWP = Struct("!BHBBBBB")
-OPRecortWS = Struct("!BHBBBB")
-OPRecortR = Struct("!BHBBB")
-
-
-def pack_to_bytes(op: Dict[str, Any], pools_map: Dict[int, int]) -> bytes:
-    op_type = get_type(op)
-    if op_type is None:
-        return b""
-
-    pool, pg = get_pool_pg(op)
-
-    try:
-        pool_log_id = pools_map[pool]
-    except KeyError:
-        raise NoPoolFound()
-
-    assert 0 <= pool_log_id <= MAX_POOL_VAL
-
-    # overflow pg
-    pg = min(MAX_PG_VAL, pg)
-
-    _, _, qpg_at, started, local_done, replicas_waiting, subop = get_timings(op)
-    flags_and_pool = (op_type.value << 6) + pool_log_id
-    assert flags_and_pool < 256
-    wait_pg = started - qpg_at
-    assert wait_pg >= 0
-    local_io = local_done - started
-    assert local_io >= 0
-
-    duration = op['duration'] * S_TO_MS
-
-    if op_type in (OP.WRITE_PRIMARY, OP.WRITE_SECONDARY):
-        dload = qpg_at
-        if op_type == OP.WRITE_PRIMARY:
-            remote_io = subop - replicas_waiting
-            assert remote_io >= 0
-            assert dload >= 0
-            assert remote_io >= 0
-            return OPRecortWP.pack(flags_and_pool, pg,
-                                   discretize(duration),
-                                   discretize(wait_pg),
-                                   discretize(dload),
-                                   discretize(local_io),
-                                   discretize(remote_io))
-        else:
-            return OPRecortWS.pack(flags_and_pool, pg,
-                                   discretize(duration),
-                                   discretize(wait_pg),
-                                   discretize(dload),
-                                   discretize(local_io))
-    else:
-        assert op_type == OP.READ
-        return OPRecortR.pack(flags_and_pool, pg,
-                              discretize(duration),
-                              discretize(wait_pg),
-                              discretize(local_io))
-
-
-def unpack_from_bytes(data: bytes, offset: int, pool_map: Dict[int, Tuple[str, int]]) -> Tuple:
-    undiscretize_l = undiscretize_map.__getitem__
-    flags_and_pool = data[offset]
-    op_type = OP(flags_and_pool >> 6)
-    pool = pool_map[flags_and_pool & 0x3F]
-
-    if op_type == OP.WRITE_PRIMARY:
-        _, pg, dura, wait_pg, dload, local_io, remote_io = OPRecortWP.unpack(data[offset: offset + OPRecortWP.size])
-        return op_type, pool, pg, undiscretize_l(dura), undiscretize_l(wait_pg), \
-               undiscretize_l(dload), undiscretize_l(local_io), undiscretize_l(remote_io), \
-               offset + OPRecortWP.size
-
-    if op_type == OP.WRITE_SECONDARY:
-        _, pg, dura, wait_pg, dload, local_io = OPRecortWS.unpack(data[offset: offset + OPRecortWS.size])
-        return op_type, pool, pg, undiscretize_l(dura), undiscretize_l(wait_pg), \
-               undiscretize_l(dload), undiscretize_l(local_io), None, offset + OPRecortWS.size
-
-    assert op_type == OP.READ, str(op_type)
-
-    _, pg, dura, wait_pg, local_io = OPRecortR.unpack(data[offset: offset + OPRecortR.size])
-    return op_type, pool, pg, undiscretize_l(dura), undiscretize_l(wait_pg), \
-           None, undiscretize_l(local_io), None, \
-           offset + OPRecortR.size
-
-
-def get_historic(osd_id: int, timeout: float = 15) -> str:
-    cmd = "ceph daemon osd.{} dump_historic_ops".format(osd_id).split()
-    return subprocess.check_output(cmd, timeout=timeout).decode("utf8")
 
 
 def open_to_append(fname: str, is_bin: bool = False) -> Union[BinaryIO, TextIO]:
@@ -307,67 +139,31 @@ def open_to_append(fname: str, is_bin: bool = False) -> Union[BinaryIO, TextIO]:
     return fd
 
 
-RADOS_DF = 'rados df -f json'
-PG_DUMP = 'ceph pg dump -f json 2>/dev/null'
-CEPH_DF = 'ceph df -f json'
-CEPH_S = 'ceph -s -f json'
+# ----------------------  file records operating functions -------------------------------------------------------------
 
 
-# start them also for SIGUSR1
-# how to guarantee that file would not be corrupted in case of daemon stopped during record
-# при старте сканировать файл до конца последней полной записи
-# при парсинге игнорировать частичную запись
+rec_header = Struct("!II")
 
 
-def dump_cluster_info(commands: List[str], timeout: float = 15) -> Iterator[Tuple[REC_ID, bytes]]:
-    output = {}
-    for cmd in commands:
-        try:
-            output[cmd] = json.loads(subprocess.check_output(cmd, shell=True, timeout=timeout).decode('utf8'))
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            pass
-
-    if output:
-        yield REC_ID.CLUSTER_INFO, bz2.compress(json.dumps(output).encode('utf8'))
-
-
-def write_record(fd: BinaryIO, rec_type: REC_ID, data: bytes):
-    record = struct.pack("!B", rec_type.value) + data
-    fd.write(struct.pack("!IL", zlib.adler32(record), len(data)))
-    fd.write(record)
-
-    try:
+def write_record(fd: BinaryIO, rec_type: RecId, data: bytes, flush: bool = True) -> None:
+    """
+    Write variable-size record to file along with checksum
+    """
+    id_bt = bytes((rec_type.value,))
+    checksum = zlib.adler32(data, zlib.adler32(id_bt))
+    fd.write(rec_header.pack(checksum, len(data) + 1) + id_bt)
+    fd.write(data)
+    if flush:
         fd.flush()
-    except AttributeError:
-        pass
 
 
-def get_bytes(fd: BinaryIO, size: int) -> bytes:
-    dt = fd.read(size)
-    if len(dt) != size:
-        raise UnexpectedEndOfFile()
-    return dt
+def iter_records(fd: BinaryIO) -> Iterator[Tuple[RecId, bytes]]:
+    """
+    iterate over records in output file, written with write_record function
+    """
 
-
-def read_header(fd: BinaryIO) -> bool:
-    offset = fd.tell()
-    fd.seek(0, os.SEEK_END)
-    if fd.tell() == 0:
-        return False
-
-    fd.seek(offset, os.SEEK_SET)
-    try:
-        hdr = get_bytes(fd, len(HEADER))
-    except UnexpectedEndOfFile:
-        fd.seek(0)
-        raise
-
-    assert hdr == HEADER, "Header corrupted"
-    return True
-
-
-def iter_records(fd: BinaryIO) -> Iterator[Tuple[REC_ID, bytes]]:
-    rec_header = Struct("!IL")
+    rec_size = rec_header.size
+    unpack = rec_header.unpack
 
     offset = fd.tell()
     fd.seek(0, os.SEEK_END)
@@ -376,19 +172,641 @@ def iter_records(fd: BinaryIO) -> Iterator[Tuple[REC_ID, bytes]]:
 
     try:
         while offset < size:
-            data = get_bytes(fd, rec_header.size)
-            checksum, data_size = rec_header.unpack(data)
-            data = get_bytes(fd, data_size + 1)
+            data = fd.read(rec_size)
+            if len(data) != rec_size:
+                raise UnexpectedEOF()
+            checksum, data_size = unpack(data)
+            data = fd.read(data_size)
+            if len(data) != data_size:
+                raise UnexpectedEOF()
             assert checksum == zlib.adler32(data), "record corrupted at offset {}".format(offset)
-            yield REC_ID(data[0]), data[1:]
-            offset += rec_header.size + data_size + 1
-    except:
+            yield RecId(data[0]), data[1:]
+            offset += rec_size + data_size
+    except Exception:
         fd.seek(offset, os.SEEK_SET)
         raise
 
 
+def read_header(fd: BinaryIO) -> Optional[bytes]:
+    """
+    read header from file, return fd positioned to first byte after the header
+    check that header is in supported headers, fail otherwise
+    must be called from offset 0
+    """
+    assert fd.tell() == 0, "read_header must be called from beginning of the file"
+    fd.seek(0, os.SEEK_END)
+    size = fd.tell()
+    if size == 0:
+        return None
+
+    fd.seek(0, os.SEEK_SET)
+    assert size >= HEADER_LEN, "Incorrect header"
+    hdr = fd.read(HEADER_LEN)
+    assert hdr in ALL_SUPPORTED_HEADERS, "Unknown header {!r}".format(hdr)
+    return hdr
+
+
+# -------------------------   historic ops helpers ---------------------------------------------------------------------
+
+
+OpRec = NewType('OpRec', Dict[str, Any])
+
+
+def parse_events(op: OpRec, initiated_at: int) -> List[Tuple[str, int]]:
+    return [(evt["event"], to_unix_ms(evt["time"]) - initiated_at)
+            for evt in op["type_data"]["events"] if evt["event"] != "initiated"]
+
+
+def get_type(op: OpRec) -> Optional[OpType]:
+    """
+    Get type for operation
+    """
+    description = op['description']
+    op_type_s, _ = description.split("(", 1)
+
+    is_read = is_write = False
+
+    if '+write+' in description:
+        is_write = True
+    elif '+read+' in description:
+        is_read = True
+
+    if op_type_s == 'osd_op':
+        if is_write:
+            return OpType.write_primary
+        if is_read:
+            return OpType.read
+    elif op_type_s == 'osd_repop':
+        assert not (is_read or is_write)
+        return OpType.write_secondary
+    return None
+
+
+def get_pool_pg(op: OpRec) -> Tuple[int, int]:
+    """
+    returns pool and pg for op
+    """
+    pool_s, pg_s = op['description'].split()[1].split(".")
+    return int(pool_s), int(pg_s, 16)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+HLTimings = NamedTuple('HLTimings', [("download", int),
+                                     ("wait_for_pg", int),
+                                     ("local_io", int),
+                                     ("wait_for_replica", int)])
+
+
+class CephOp:
+    def __init__(self,
+                 description: str,
+                 initiated_at: int,
+                 tp: Optional[OpType],
+                 duration: int,
+                 pool_id: int,
+                 pg: int,
+                 events: List[Tuple[str, int]]) -> None:
+        self.description = description
+        self.initiated_at = initiated_at
+        self.tp = tp
+        self.duration = duration
+        self.pool_id = pool_id
+        self.pack_pool_id = None  # type: Optional[int]
+        self.pg = pg
+        self.events = events
+        self.evt_map = dict(events)
+
+    @classmethod
+    def parse_op(cls, op: OpRec) -> 'CephOp':
+        initiated_at = to_unix_ms(op['initiated_at'])
+        pool, pg = get_pool_pg(op)
+        return cls(
+            description=op['description'],
+            initiated_at=initiated_at,
+            tp=get_type(op),
+            duration=int(op['duration'] * 1000),
+            pool_id=pool,
+            pg=pg,
+            events=parse_events(op, initiated_at))
+
+    def get_hl_timings(self) -> HLTimings:
+        qpg_at = self.evt_map.get("queued_for_pg", -1)
+        started = self.evt_map.get("started", self.evt_map.get("reached_pg", -1))
+
+        try:
+            local_done = self.evt_map["op_applied"] if 'op_applied' in self.evt_map else self.evt_map["done"]
+        except KeyError:
+            local_done = -1
+
+        last_replica_done = -1
+        subop = -1
+        for evt, tm in self.evt_map.items():
+            if evt.startswith("waiting for subops from"):
+                last_replica_done = tm
+            elif evt.startswith("sub_op_commit_rec from"):
+                subop = max(tm, subop)
+
+        wait_for_pg = started - qpg_at
+        assert wait_for_pg >= 0
+        local_io = local_done - started
+        assert local_io >= 0
+
+        wait_for_replica = -1
+        if self.tp in (OpType.write_primary, OpType.write_secondary):
+            download = qpg_at
+            if self.tp == OpType.write_primary:
+                assert subop != -1
+                assert last_replica_done != -1
+                wait_for_replica = subop - last_replica_done
+        else:
+            download = -1
+
+        return HLTimings(download=download, wait_for_pg=wait_for_pg, local_io=local_io,
+                         wait_for_replica=wait_for_replica)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+class IPacker(metaclass=abc.ABCMeta):
+    """
+    Abstract base class to back ceph operations to bytes
+    """
+    name = None  # type: str
+
+    @classmethod
+    @abc.abstractmethod
+    def pack_op(cls, op: CephOp) -> bytes:
+        pass
+
+    @classmethod
+    @abc.abstractmethod
+    def unpack_op(cls, data: bytes, offset: int) -> Tuple[Dict[str, Any], int]:
+        pass
+
+    @staticmethod
+    @abc.abstractmethod
+    def format_op(op: Dict[str, Any]) -> str:
+        pass
+
+    @classmethod
+    def unpack(cls, rec_tp: RecId, data: bytes) -> Any:
+        if rec_tp in (RecId.pools, RecId.params, RecId.cluster_info):
+            return json.loads(data.decode('utf8'))
+        elif rec_tp == RecId.ops:
+            osd_id, ctime = cls.op_header.unpack(data[:cls.op_header.size])
+            offset = cls.op_header.size
+            ops = []
+            while offset < len(data):
+                params, offset = cls.unpack_op(data, offset)
+                params.update({"osd_id": osd_id, "time": ctime})
+                ops.append(params)
+            return ops
+        else:
+            raise AssertionError("Unknown record type {}".format(rec_tp))
+
+    op_header = Struct("!HI")
+
+    @classmethod
+    def pack_iter(cls, data_iter: Iterable[Tuple[RecId, Any]]) -> Iterator[Tuple[RecId, bytes]]:
+        for rec_tp, data in data_iter:
+            if rec_tp in (RecId.pools, RecId.cluster_info):
+                assert isinstance(data, dict)
+                yield rec_tp, json.dumps(data).encode('utf8')
+            elif rec_tp == RecId.ops:
+                osd_id, ctime, ops = data
+                assert isinstance(osd_id, int)
+                assert isinstance(ctime, int)
+                assert isinstance(ops, list)
+                assert all(isinstance(rec, CephOp) for rec in ops)
+                packed = b"".join(cls.pack_op(op) for op in ops)
+                if packed:
+                    yield RecId.ops, cls.op_header.pack(osd_id, ctime) + packed
+            else:
+                raise AssertionError("Unknown record type {}".format(rec_tp))
+
+
+class CompactPacker(IPacker):
+    """
+    Compact packer - pack op to 6-8 bytes with timings for high-level stages - downlaod, wait pg, local io, remote io
+    """
+
+    name = 'compact'
+
+    OPRecortWP = Struct("!BHBBBBB")
+    OPRecortWS = Struct("!BHBBBB")
+    OPRecortR = Struct("!BHBBB")
+
+    @classmethod
+    def pack_op(cls, op: CephOp) -> bytes:
+        assert op.pack_pool_id is not None
+        assert 0 <= op.pack_pool_id <= MAX_POOL_VAL
+        assert op.tp is not None
+
+        # overflow pg
+        if op.pg > MAX_PG_VAL:
+            logger.debug("Too large pg = %d", op.pg)
+
+        pg = min(MAX_PG_VAL, op.pg)
+
+        timings = op.get_hl_timings()
+        flags_and_pool = (cast(int, op.tp.value) << 6) + op.pack_pool_id
+        assert flags_and_pool < 256
+
+        if op.tp == OpType.write_primary:
+            return cls.OPRecortWP.pack(flags_and_pool, pg,
+                                       discretize(op.duration),
+                                       discretize(timings.wait_for_pg),
+                                       discretize(timings.download),
+                                       discretize(timings.local_io),
+                                       discretize(timings.wait_for_replica))
+
+        if op.tp == OpType.write_secondary:
+            return cls.OPRecortWS.pack(flags_and_pool, pg,
+                                       discretize(op.duration),
+                                       discretize(timings.wait_for_pg),
+                                       discretize(timings.download),
+                                       discretize(timings.local_io))
+
+        assert op.tp == OpType.read, "Unknown op type {}".format(op.tp)
+        return cls.OPRecortR.pack(flags_and_pool, pg,
+                                  discretize(op.duration),
+                                  discretize(timings.wait_for_pg),
+                                  discretize(timings.download))
+
+    @classmethod
+    def unpack_op(cls, data: bytes, offset: int) -> Tuple[Dict[str, Any], int]:
+
+        undiscretize_l = undiscretize_map.__getitem__  # type: Callable[[int], float]
+        flags_and_pool = data[offset]
+        op_type = OpType(flags_and_pool >> 6)
+        pool = flags_and_pool & 0x3F
+
+        if op_type == OpType.write_primary:
+            _, pg, duration, wait_for_pg, download, local_io, wait_for_replica = \
+                cls.OPRecortWP.unpack(data[offset: offset + cls.OPRecortWP.size])
+
+            return {'tp': op_type,
+                    'pack_pool_id': pool,
+                    'pg': pg,
+                    'duration': undiscretize_l(duration),
+                    'wait_for_pg': undiscretize_l(wait_for_pg),
+                    'local_io': undiscretize_l(local_io),
+                    'wait_for_replica': undiscretize_l(wait_for_replica),
+                    'download': undiscretize_l(download),
+                    'packer': cls.name}, offset + cls.OPRecortWP.size
+
+        if op_type == OpType.write_secondary:
+            _, pg, duration, wait_for_pg, download, local_io = \
+                cls.OPRecortWS.unpack(data[offset: offset + cls.OPRecortWS.size])
+            return {'tp': op_type,
+                    'pack_pool_id': pool,
+                    'pg': pg,
+                    'duration': undiscretize_l(duration),
+                    'wait_for_pg': undiscretize_l(wait_for_pg),
+                    'local_io': undiscretize_l(local_io),
+                    'download': undiscretize_l(download),
+                    'packer': cls.name}, offset + cls.OPRecortWS.size
+
+        assert op_type == OpType.read, "Unknown op type {}".format(op_type)
+        _, pg, duration, wait_for_pg, local_io = cls.OPRecortR.unpack(data[offset: offset + cls.OPRecortR.size])
+        return {'tp': op_type,
+                'pack_pool_id': pool,
+                'pg': pg,
+                'duration': undiscretize_l(duration),
+                'wait_for_pg': undiscretize_l(wait_for_pg),
+                'local_io': undiscretize_l(local_io),
+                'packer': cls.name}, offset + cls.OPRecortR.size
+
+    @staticmethod
+    def format_op(op: Dict[str, Any]) -> str:
+        if op['tp'] == OpType.write_primary:
+            assert 'wait_for_pg' in op
+            assert 'download' in op
+            assert 'local_io' in op
+            assert 'wait_for_replica' in op
+            return (("WRITE_PRIMARY     {:>25s}:{:<5x} osd_id={:>4d}   duration={:>5d}   dload={:>5d}" +
+                     "   wait_pg={:>5d}   local_io={:>5d}   remote_io={:>5d}").
+                    format(op['pool_name'], op['pg'], op['osd_id'], int(op['duration']), int(op['download']),
+                           int(op['wait_for_pg']), int(op['local_io']), int(op['wait_for_replica'])))
+        elif op['tp'] == OpType.write_secondary:
+            assert 'wait_for_pg' in op
+            assert 'download' in op
+            assert 'local_io' in op
+            assert 'wait_for_replica' not in op
+            return (("WRITE_SECONDARY   {:>25s}:{:<5x} osd_id={:>4d}   duration={:>5d}   " +
+                     "dload={:>5d}   wait_pg={:>5d}   local_io={:>5d}").
+                    format(op['pool_name'], op['pg'], op['osd_id'], int(op['duration']),
+                           int(op['download']), int(op['wait_for_pg']), int(op['local_io'])))
+        elif op['tp'] == OpType.read:
+            assert 'wait_for_pg' in op
+            assert 'download' not in op
+            assert 'local_io' in op
+            assert 'wait_for_replica' not in op
+            return (("READ              {:>25s}:{:<5x} osd_id={:>4d}" +
+                     "   duration={:>5d}   wait_pg={:>5d}   local_io={:>5d}").
+                    format(op['pool_name'], op['pg'], op['osd_id'], int(op['duration']), int(op['wait_for_pg']),
+                           int(op['local_io'])))
+        else:
+            assert False, "Unknown op {}".format(op['tp'])
+
+
+class RawPacker(IPacker):
+    """
+    Compact packer - pack op to 6-8 bytes with timings for high-level stages - downlaod, wait pg, local io, remote io
+    """
+
+    name = 'raw'
+
+    OPRecortWP = Struct("!BH" + 'B' * 10)
+    OPRecortWS = Struct("!BH" + 'B' * 7)
+
+    @classmethod
+    def pack_op(cls, op: CephOp) -> bytes:
+        assert op.pack_pool_id is not None
+        assert 0 <= op.pack_pool_id <= MAX_POOL_VAL
+        assert op.tp is not None
+
+        # overflow pg
+        if op.pg > MAX_PG_VAL:
+            logger.debug("Too large pg = %d", op.pg)
+
+        pg = min(MAX_PG_VAL, op.pg)
+
+        assert op.tp in (OpType.write_primary, OpType.write_secondary, OpType.read), "Unknown op type {}".format(op.tp)
+
+        queued_for_pg = -1
+        reached_pg = -1
+        sub_op_commit_rec = -1
+        wait_for_subop = -1
+
+        for evt, tm in op.events:
+            if evt == 'queued_for_pg' and queued_for_pg == -1:
+                queued_for_pg = tm
+            elif evt == 'reached_pg':
+                reached_pg = tm
+            elif evt.startswith("sub_op_commit_rec from "):
+                sub_op_commit_rec = tm
+            elif evt.startswith("waiting for subops from "):
+                wait_for_subop = tm
+
+        assert reached_pg != -1
+        assert queued_for_pg != -1
+
+        if op.tp == OpType.write_primary:
+            assert sub_op_commit_rec != -1
+            assert wait_for_subop != -1
+
+        flags_and_pool = (cast(int, op.tp.value) << 6) + op.pack_pool_id
+        assert flags_and_pool < 256
+
+        try:
+            if op.tp == OpType.write_primary:
+                # first queued_for_pg
+                # last reached_pg
+                # started
+                # wait_for_subop
+                # op_commit
+                # op_applied
+                # last sub_op_commit_rec
+                # commit_sent
+                # done
+                return cls.OPRecortWP.pack(flags_and_pool, pg,
+                                           discretize(op.duration),
+                                           discretize(queued_for_pg),
+                                           discretize(reached_pg),
+                                           discretize(op.evt_map['started']),
+                                           discretize(wait_for_subop),
+                                           discretize(op.evt_map['op_commit']),
+                                           discretize(op.evt_map['op_applied']),
+                                           discretize(sub_op_commit_rec),
+                                           discretize(op.evt_map['commit_sent']),
+                                           discretize(op.evt_map['done']))
+
+            if op.tp == OpType.write_secondary:
+                # first queued_for_pg
+                # last reached_pg
+                # started
+                # commit_send
+                # sub_op_applied
+                # done
+                return cls.OPRecortWS.pack(flags_and_pool, pg,
+                                           discretize(op.duration),
+                                           discretize(queued_for_pg),
+                                           discretize(reached_pg),
+                                           discretize(op.evt_map['started']),
+                                           discretize(op.evt_map['commit_sent']),
+                                           discretize(op.evt_map['sub_op_applied']),
+                                           discretize(op.evt_map['done']))
+        except KeyError:
+            import pprint
+            pprint.pprint(op.evt_map)
+            raise
+        assert op.tp == OpType.read, "Unknown op type {}".format(op.tp)
+        return b""
+        # return cls.OPRecortR.pack(flags_and_pool, pg,
+        #                           discretize(op.duration),
+        #                           discretize(queued_for_pg),
+        #                           discretize(reached_pg))
+
+    @classmethod
+    def unpack_op(cls, data: bytes, offset: int) -> Tuple[Dict[str, Any], int]:
+
+        undiscretize_l = undiscretize_map.__getitem__  # type: Callable[[int], float]
+        flags_and_pool = data[offset]
+        op_type = OpType(flags_and_pool >> 6)
+        pool = flags_and_pool & 0x3F
+
+        if op_type == OpType.write_primary:
+            _, pg, duration, queued_for_pg, reached_pg, started, wait_for_subop, \
+                op_commit, op_applied, sub_op_commit_rec, commit_sent, done = \
+                cls.OPRecortWP.unpack(data[offset: offset + cls.OPRecortWP.size])
+
+            return {'tp': op_type,
+                    'pack_pool_id': pool,
+                    'pg': pg,
+                    'duration': undiscretize_l(duration),
+                    'queued_for_pg': undiscretize_l(queued_for_pg),
+                    'reached_pg': undiscretize_l(reached_pg),
+                    'started': undiscretize_l(started),
+                    'wait_for_subop': undiscretize_l(wait_for_subop),
+                    'op_commit': undiscretize_l(op_commit),
+                    'op_applied': undiscretize_l(op_applied),
+                    'sub_op_commit_rec': undiscretize_l(sub_op_commit_rec),
+                    'commit_sent': undiscretize_l(commit_sent),
+                    'done': undiscretize_l(done),
+                    'packer': cls.name}, offset + cls.OPRecortWP.size
+
+        if op_type == OpType.write_secondary:
+            _, pg, duration, queued_for_pg, reached_pg, started, commit_send, sub_op_applied, done = \
+                cls.OPRecortWS.unpack(data[offset: offset + cls.OPRecortWS.size])
+            return {'tp': op_type,
+                    'pack_pool_id': pool,
+                    'pg': pg,
+                    'duration': undiscretize_l(duration),
+                    'queued_for_pg': undiscretize_l(queued_for_pg),
+                    'reached_pg': undiscretize_l(reached_pg),
+                    'started': undiscretize_l(started),
+                    'commit_send': undiscretize_l(commit_send),
+                    'sub_op_applied': undiscretize_l(sub_op_applied),
+                    'done': undiscretize_l(done),
+                    'packer': cls.name}, offset + cls.OPRecortWS.size
+
+        assert False, "Unknown op type {}".format(op_type)
+        # assert op_type == OpType.read, "Unknown op type {}".format(op_type)
+        # _, pg, duration, wait_for_pg, local_io = cls.OPRecortR.unpack(data[offset: offset + cls.OPRecortR.size])
+        # return {'tp': op_type,
+        #         'pack_pool_id': pool,
+        #         'pg': pg,
+        #         'duration': undiscretize_l(duration),
+        #         'wait_for_pg': undiscretize_l(wait_for_pg),
+        #         'local_io': undiscretize_l(local_io)}, offset + cls.OPRecortR.size
+
+    @staticmethod
+    def format_op(op: Dict[str, Any]) -> str:
+        if op['tp'] == OpType.write_primary:
+            return (("WRITE_PRIMARY     {:>25s}:{:<5x} osd_id={:>4d}   q_for_pg={:>5d}  reached_pg={:>5d}" +
+                     "   started={:>5d}   subop={:>5d}   commit={:>5d}   applied={:>5d} subop_ready={:>5d}" +
+                     "  commit={:>5d} done={:>5d}").
+                    format(op['pool_name'], op['pg'], op['osd_id'], int(op['queued_for_pg']),
+                           int(op['reached_pg']),
+                           int(op['started']),
+                           int(op['wait_for_subop']),
+                           int(op['op_commit']),
+                           int(op['op_applied']),
+                           int(op['sub_op_commit_rec']),
+                           int(op['commit_sent']),
+                           int(op['done']),
+                           ))
+        elif op['tp'] == OpType.write_secondary:
+            return (("WRITE_SECONDARY   {:>25s}:{:<5x} osd_id={:>4d}   q_for_pg={:>5d}  reached_pg={:>5d}" +
+                     "   started={:>5d}                 commit={:>5d}   applied={:>5d}" +
+                     "                                 done={:>5d}").
+                    format(op['pool_name'], op['pg'], op['osd_id'], int(op['queued_for_pg']),
+                           int(op['reached_pg']),
+                           int(op['started']),
+                           int(op['commit_send']),
+                           int(op['sub_op_applied']),
+                           int(op['done']),
+                           ))
+        else:
+            assert False, "Unknown op {}".format(op['tp'])
+
+
+ALL_PACKERS = [CompactPacker, RawPacker]
+
+
+def get_packer(name: str) -> Type[IPacker]:
+    for packer_cls in ALL_PACKERS:
+        if packer_cls.name == name:
+            return packer_cls
+    raise AssertionError("Unknown packer {}".format(name))
+
+
+# --------- CEPH UTILS -------------------------------------------------------------------------------------------------
+
+
+def get_local_osds(target_class: str = None, timeout: int = 15) -> Set[int]:
+    """
+    Get OSD id's for current node from ceph osd tree for selected osd class (all classes by default)
+    Search by hostname, as returned from socket.gethostname
+    In case if method above failed - search by osd cluster/public ip address
+    """
+
+    # find by node name
+    hostnames = {socket.gethostname(), socket.getfqdn()}
+
+    def get_all_child_osds(node: Dict, crush_nodes: Dict[int, Dict]) -> Iterator[int]:
+        if node['type'] == 'osd':
+            if target_class is None or node.get('device_class') == target_class:
+                yield node['id']
+            return
+
+        for ch_id in node['children']:
+            yield from get_all_child_osds(crush_nodes[ch_id], crush_nodes)
+
+    tree_js = subprocess.check_output("ceph osd tree -f json".split(), timeout=timeout).decode("utf8")
+    nodes = {node['id']: node for node in json.loads(tree_js)['nodes']}
+
+    all_osds_by_node_name = None
+    for node in nodes.values():
+        if node['type'] == 'host' and node['name'] in hostnames:
+            assert all_osds_by_node_name is None, \
+                "Current node with names {} found two times in osd tree".format(hostnames)
+            all_osds_by_node_name = set(get_all_child_osds(node, nodes))
+
+    if all_osds_by_node_name is not None:
+        return all_osds_by_node_name
+
+    all_osds_by_node_ip = set()
+
+    # find by node ips
+    all_ips = subprocess.check_output("hostname -I".split(), timeout=timeout).decode("utf8").split()
+    osds_js = subprocess.check_output("ceph osd dump -f json".split(), timeout=timeout).decode("utf8")
+    for osd in json.loads(osds_js)['osds']:
+        public_ip = osd['public_addr'].split(":", 1)[0]
+        cluster_ip = osd['cluster_addr'].split(":", 1)[0]
+        if public_ip in all_ips or cluster_ip in all_ips:
+            if target_class is None or target_class == nodes[osd['id']].get('device_class'):
+                all_osds_by_node_ip.add(osd['id'])
+    return all_osds_by_node_ip
+
+
+def set_size_duration(osd_ids: Set[int], size: int, duration: int, timeout: int = 15) -> Set[int]:
+    """
+    Set size and duration for historic_ops log
+    """
+    not_inited_osd = set()
+    for osd_id in osd_ids:
+        try:
+            for set_part in ["osd_op_history_duration {}".format(duration), "osd_op_history_size {}".format(size)]:
+                cmd = "ceph daemon osd.{} config set {}"
+                out = subprocess.check_output(cmd.format(osd_id, set_part).split(),
+                                              stderr=subprocess.STDOUT,
+                                              timeout=timeout).decode("utf8")
+                assert "success" in out
+        except subprocess.SubprocessError:
+            not_inited_osd.add(osd_id)
+    return not_inited_osd
+
+
+def get_historic(osd_id: int, timeout: int = 15) -> str:
+    """
+    Get historic ops from osd
+    """
+    cmd = "ceph daemon osd.{} dump_historic_ops".format(osd_id).split()
+    return subprocess.check_output(cmd, timeout=timeout).decode("utf8")
+
+
+# TODO: start them also for SIGUSR1
+
+RADOS_DF = 'rados df -f json'
+PG_DUMP = 'ceph pg dump -f json 2>/dev/null'
+CEPH_DF = 'ceph df -f json'
+CEPH_S = 'ceph -s -f json'
+
+
+def dump_cluster_info(commands: List[str], timeout: float = 15) -> Optional[List[Tuple[RecId, Dict[str, str]]]]:
+    """
+    make a message with provided cmd outputs
+    """
+    output = {}
+    for cmd in commands:
+        try:
+            output[cmd] = json.loads(subprocess.check_output(cmd, shell=True, timeout=timeout).decode('utf8'))
+        except subprocess.SubprocessError:
+            pass
+
+    if output:
+        return [(RecId.cluster_info, output)]
+
+    return None  # make mypy happy
+
+
 class CephDumper:
-    def __init__(self, osd_ids: Set[int], size: int, duration: int, cmd_tout: int = 15) -> None:
+    def __init__(self, osd_ids: Set[int], size: int, duration: int, cmd_tout: int = 15, min_diration: int = 0) -> None:
         self.osd_ids = osd_ids
         self.not_inited_osd = osd_ids.copy()
         self.pools_map = {}  # type: Dict[int, Tuple[str, int]]
@@ -396,87 +814,97 @@ class CephDumper:
         self.size = size
         self.duration = duration
         self.cmd_tout = cmd_tout
+        self.min_duration = min_diration
         self.last_time_ops = defaultdict(set)  # type: Dict[int, Set[str]]
+        self.first_cycle = True
 
-    def reload_pools(self):
-        self.pools_map.clear()
-        self.pools_map_no_name.clear()
-
+    def reload_pools(self) -> bool:
         output = subprocess.check_output("ceph osd lspools -f json".split(), timeout=self.cmd_tout)
         data = json.loads(output.decode("utf8"))
 
+        new_pools_map = {}
         for idx, pool in enumerate(sorted(data, key=lambda x: x['poolname'])):
-            pool['idx'] = idx
-            self.pools_map[pool['poolnum']] = (pool['poolname'], idx)
-            self.pools_map_no_name[pool['poolnum']] = idx
+            new_pools_map[pool['poolnum']] = (pool['poolname'], idx)
 
-    def dump_historic(self) -> Iterator[Tuple[REC_ID, bytes]]:
+        if new_pools_map != self.pools_map:
+            self.pools_map = new_pools_map
+            self.pools_map_no_name = {num: idx for num, (_, idx) in new_pools_map.items()}
+            return True
+        return False
+
+    def dump_historic(self) -> Iterator[Tuple[RecId, Any]]:
         if self.not_inited_osd:
-            self.not_inited_osd = set_size_duration(self.not_inited_osd, self.size, self.duration)
+            self.not_inited_osd = set_size_duration(self.not_inited_osd, self.size, self.duration,
+                                                    timeout=self.cmd_tout)
+
+        ctime = int(time.time())
+        osd_ops = {}  # type: Dict[int, str]
 
         for osd_id in self.osd_ids:
             if osd_id not in self.not_inited_osd:
                 try:
-                    data = get_historic(osd_id)
+                    osd_ops[osd_id] = get_historic(osd_id)
                     # data = get_historic_fast(osd_id)
                 except (subprocess.CalledProcessError, OSError):
                     self.not_inited_osd.add(osd_id)
                     continue
 
-                try:
-                    parsed = json.loads(data)
-                except:
-                    raise Exception(repr(data))
+        if self.reload_pools():
+            if self.first_cycle:
+                yield RecId.pools, self.pools_map
+            else:
+                # pools updated - skip this cycle, as different ops may came from pools before and after update
+                return
 
-                if self.size != parsed['size'] or self.duration != parsed['duration']:
-                    self.not_inited_osd.add(osd_id)
-                    continue
+        for osd_id, data in osd_ops.items():
+            try:
+                parsed = json.loads(data)
+            except Exception:
+                raise Exception(repr(data))
 
-                ops = [op for op in parsed['ops'] if op['description'] not in self.last_time_ops[osd_id]]
-                self.last_time_ops[osd_id] = {op['description'] for op in ops}
-                for rec_id, rec_data in self.pack_ops(ops, osd_id):
-                    yield rec_id, rec_data
+            if self.size != parsed['size'] or self.duration != parsed['duration']:
+                self.not_inited_osd.add(osd_id)
+                continue
 
-    op_header = Struct("!HI")
+            ops = [CephOp.parse_op(op) for op in parsed['ops']]
+            ops = [op for op in ops if op.tp is not None and op.description not in self.last_time_ops[osd_id]]
+            if self.min_duration:
+                ops = [op for op in ops if op.duration >= self.min_duration]
+            self.last_time_ops[osd_id] = {op.description for op in ops}
 
-    def pack_ops(self, ops: List, osd_id: int) -> Iterator[Tuple[REC_ID, bytes]]:
-        try:
-            packed = [pack_to_bytes(op, self.pools_map_no_name) for op in ops]
-        except NoPoolFound:
-            self.reload_pools()
-            yield REC_ID.POOLS, json.dumps(self.pools_map).encode('utf8')
-            packed = [pack_to_bytes(op, self.pools_map_no_name) for op in ops]
+            for op in ops:
+                assert op.pack_pool_id is None
+                op.pack_pool_id = self.pools_map_no_name[op.pool_id]
 
-        packed_s = b"".join(packed)
-        if packed_s:
-            yield REC_ID.OPS, struct.pack("!HI", osd_id, int(time.time())) + packed_s
-
-    @classmethod
-    def unpack_ops_header(cls, data: bytes) -> Tuple[int, int, int]:
-        return (*cls.op_header.unpack(data[:cls.op_header.size]), cls.op_header.size)  # type: ignore
+            yield RecId.ops, (osd_id, ctime, ops)
 
 
-InfoFunc = Callable[[], Iterator[Tuple[REC_ID, bytes]]]
+InfoFunc = Callable[[], Iterator[Tuple[RecId, Any]]]
 
 
-def to_list(handler: InfoFunc) -> List[Tuple[REC_ID, bytes]]:
-    return list(handler())
+def thread_func(handler: InfoFunc, packer: IPacker) -> List[Tuple[RecId, bytes]]:
+    return list(packer.pack_iter(handler()))
 
 
-def dump_loop(opts: Any, osd_ids: Set[int], fd: BinaryIO):
+def dump_loop(opts: Any, osd_ids: Set[int], fd: BinaryIO) -> None:
     handlers = []  # type: List[Tuple[str, InfoFunc, float]]
 
+    packer = get_packer(opts.packer)
+
     if opts.record_cluster != 0:
-        func = partial(dump_cluster_info, (RADOS_DF, CEPH_DF, CEPH_S), opts.timeout)
-        handlers.append(("cluster_info", func, opts.record_cluster))
+        func = partial(dump_cluster_info, (RADOS_DF, CEPH_DF, CEPH_S), opts.timeout)  # type: ignore
+        func = partial(thread_func, func, packer)  # type: ignore
+        handlers.append(("cluster_info", func, opts.record_cluster))  # type: ignore
 
     if opts.record_pg_dump != 0:
-        func = partial(dump_cluster_info, (PG_DUMP,), opts.timeout)
-        handlers.append(("pg_dump", func, opts.record_pg_dump))
+        func = partial(dump_cluster_info, (PG_DUMP,), opts.timeout)  # type: ignore
+        func = partial(thread_func, func, packer)  # type: ignore
+        handlers.append(("pg_dump", func, opts.record_pg_dump))  # type: ignore
 
-    dumper = CephDumper(osd_ids, opts.size, opts.duration, opts.timeout)
+    dumper = CephDumper(osd_ids, opts.size, opts.duration, opts.timeout, opts.min_duration)
 
-    handlers.append(("historic", dumper.dump_historic, opts.duration))
+    func = partial(thread_func, dumper.dump_historic, packer)  # type: ignore
+    handlers.append(("historic", func, opts.duration))  # type: ignore
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(handlers))
     futures = {}  # type: Dict[concurrent.futures.Future, Tuple[int, float, float]]
@@ -484,6 +912,7 @@ def dump_loop(opts: Any, osd_ids: Set[int], fd: BinaryIO):
     ctime = time.time()
     handlers_q = [(ctime, idx) for idx in range(len(handlers))]
     heapq.heapify(handlers_q)
+
     while True:
         stime = handlers_q[0][0] - ctime if handlers_q else 0.5
 
@@ -492,7 +921,7 @@ def dump_loop(opts: Any, osd_ids: Set[int], fd: BinaryIO):
                                               timeout=stime,
                                               return_when=concurrent.futures.FIRST_COMPLETED)
             for fut in done:
-                idx, next_time, prev_time = futures.pop(fut)
+                idx, prev_time, next_time = futures.pop(fut)
                 name, _, tout = handlers[idx]
                 for rec_id, data in fut.result(timeout=0):
                     logger.debug("Handler %s provides %s bytes of data of type %s", name, len(data), rec_id)
@@ -508,49 +937,48 @@ def dump_loop(opts: Any, osd_ids: Set[int], fd: BinaryIO):
         ctime = time.time()
         if handlers_q and handlers_q[0][0] <= ctime:
             stime, idx = heapq.heappop(handlers_q)
-            _, func, tout = handlers[idx]
-            future = executor.submit(to_list, func)
+            _, handler, tout = handlers[idx]
+            future = executor.submit(handler)
             futures[future] = (idx, stime, stime + tout)
 
 
-def seek_to_last_valid_record(fd: BinaryIO) -> bool:
-    try:
-        has_header = read_header(fd)
-    except (UnexpectedEndOfFile, AssertionError, ValueError):
-        logger.warning("File header corrupted. Clear it")
-        fd.seek(0, os.SEEK_SET)
-        fd.truncate()
-        return False
+def seek_to_last_valid_record(fd: BinaryIO) -> Optional[bytes]:
+    header = read_header(fd)
 
-    if not has_header:
-        return False
+    if header is None:
+        return None
 
     try:
         for _ in iter_records(fd):
             pass
-    except (UnexpectedEndOfFile, AssertionError, ValueError):
+    except (UnexpectedEOF, AssertionError, ValueError):
         logger.warning("File corrupted after offset %d. Truncate to last valid offset", fd.tell())
         fd.truncate()
 
-    return True
+    return header
 
 
 def record_to_file(opts: Any) -> int:
     logger.info("Start recording with opts = %s", " ".join(sys.argv))
+    params = {'packer': opts.packer, 'cmd': sys.argv}
     try:
-        osd_ids = get_ids()
+        osd_ids = get_local_osds()
         logger.info("osds = %s", osd_ids)
 
-        fd = open_to_append(opts.output_file, True)
-
-        with fd:
+        with cast(BinaryIO, open_to_append(opts.output_file, True)) as fd:
             fd.seek(0, os.SEEK_SET)
-            has_header = seek_to_last_valid_record(fd)
-            if not has_header:
-                fd.write(HEADER)
-                fd.flush()
+            header = seek_to_last_valid_record(fd)
 
+            if header is None:
+                fd.seek(0, os.SEEK_SET)
+                fd.write(HEADER_LAST)
+            else:
+                assert header == HEADER_LAST, "Can only append to file with {} version".format(HEADER_LAST_NAME)
+
+            write_record(fd, RecId.params, json.dumps(params).encode("utf8"))
             dump_loop(opts, osd_ids, fd)
+    except UTExit:
+        raise
     except Exception as exc:
         logger.exception("During recording")
         if isinstance(exc, OSError):
@@ -559,67 +987,50 @@ def record_to_file(opts: Any) -> int:
     return 0
 
 
-class UnexpectedEndOfFile(Exception): pass
-
-
-def parse(fd: BinaryIO) -> Iterator[Tuple]:
-    pools_map = {}  # type: Dict[int, Tuple[str, int]]
-
-    if not read_header(fd):
+def parse(fd: BinaryIO) -> Iterator[Tuple[RecId, Any]]:
+    header = read_header(fd)
+    if header is None:
         return
 
-    for rec_type, data in iter_records(fd):
+    packer = None  # type: Optional[Type[IPacker]]
+    if header == HEADER_V11:
+        packer = CompactPacker
 
-        if rec_type == REC_ID.POOLS:
-            pools_map = {pool_id: (name, orig_id_s)
-                         for orig_id_s, (name, pool_id) in json.loads(data.decode('utf8')).items()}
-        elif rec_type == REC_ID.CLUSTER_INFO:
-            data_decompressed = bz2.decompress(data).decode('utf8')
-            result = json.loads(data_decompressed)
-            print("Ceph info:", ", ".join(result))
+    riter = iter_records(fd)
+    pools_map = None  # type: Optional[Dict[int, Tuple[str, int]]]
+
+    for rec_type, data in riter:
+        if rec_type in (RecId.ops, RecId.cluster_info, RecId.pools):
+            assert packer is not None, "No 'params' record found in file"
+            res = packer.unpack(rec_type, data)
+            if rec_type == RecId.ops:
+                assert pools_map is not None, "No 'pools' record found in file"
+                for op in res:
+                    op['pool_name'], op['pool'] = pools_map[op['pack_pool_id']]
+            elif rec_type == RecId.pools:
+                pools_map = {pack_id: (name, real_id) for real_id, (name, pack_id) in res.items()}
+            yield rec_type, res
+        elif rec_type == RecId.params:
+            params = json.loads(data.decode("utf8"))
+            packer = get_packer(params['packer'])
+            yield rec_type, params
         else:
-            assert rec_type == REC_ID.OPS, "Unknown rec type {} at offset {}".format(rec_type, fd.tell())
-            osd_id, stime, offset = CephDumper.unpack_ops_header(data)
-            while offset != len(data):
-                *params, offset = unpack_from_bytes(data, offset, pools_map)
-                yield (osd_id, *params)
+            raise AssertionError("Unknown rec type {} at offset {}".format(rec_type, fd.tell()))
 
 
-def format_op(osd_id: int, op_type: OP, pool_name: str, pg: int,
-              dura: float, wait_pg: float, dload: float, local_io: float, remote_io: float):
-    if op_type == OP.WRITE_PRIMARY:
-        assert wait_pg is not None
-        assert dload is not None
-        assert local_io is not None
-        assert remote_io is not None
-        return (("WRITE_PRIMARY     {:>25s}:{:<5x} osd_id={:>4d}   duration={:>5d}   wait_pg={:>5d}   local_io={:>5d}" +
-                 "   dload={:>5d}   remote_io={:>5d}").
-                 format(pool_name, pg, osd_id, int(dura), int(wait_pg), int(dload), int(local_io), int(remote_io)))
-    elif op_type == OP.WRITE_SECONDARY:
-        assert wait_pg is not None
-        assert dload is not None
-        assert local_io is not None
-        assert remote_io is None
-        return (("WRITE_SECONDARY   {:>25s}:{:<5x} osd_id={:>4d}   duration={:>5d}   " +
-                 "wait_pg={:>5d}   local_io={:>5d}   dload={:>5d}").
-                format(pool_name, pg, osd_id, int(dura), int(wait_pg), int(dload), int(local_io)))
-    elif op_type == OP.READ:
-        assert wait_pg is not None
-        assert dload is None
-        assert local_io is not None
-        assert remote_io is None
-        return ("READ              {:>25s}:{:<5x} osd_id={:>4d}   duration={:>5d}   wait_pg={:>5d}   local_io={:>5d}".
-                format(pool_name, pg, osd_id, int(dura), int(wait_pg), int(local_io)))
-    else:
-        assert False, "Unknown op"
-
-
-def print_records_from_file(file: str, limit: Optional[int]):
+def print_records_from_file(file: str, limit: Optional[int]) -> None:
     with open(file, "rb") as fd:
-        for idx, (osd_id, op_type, (pool_name, _), pg, *times) in enumerate(parse(fd)):
-            print(format_op(osd_id, op_type, pool_name, pg, *times))
-            if limit is not None and idx == limit:
-                break
+        idx = 0
+        for tp, val in parse(fd):
+            if tp == RecId.ops:
+                for op in val:
+                    idx += 1
+                    if op['packer'] == 'compact':
+                        print(CompactPacker.format_op(op))
+                    if op['packer'] == 'raw':
+                        print(RawPacker.format_op(op))
+                    if limit is not None and idx == limit:
+                        return
 
 
 ALLOWED_LOG_LEVELS = ['DEBUG', 'INFO', 'WARNING', 'ERROR']
@@ -636,10 +1047,17 @@ def parse_args(argv: List[str]) -> Any:
     set_parser.add_argument("--duration", required=True, type=int, help="Duration to keep")
     set_parser.add_argument("--size", required=True, type=int, help="Num request to keep")
 
+    subparsers.add_parser('set_default', help="config osd's historic ops to default 20/600")
+
     record_parser = subparsers.add_parser('record', help="Dump osd's requests periodically")
     record_parser.add_argument("--duration", required=True, type=int, help="Duration to keep")
     record_parser.add_argument("--size", required=True, type=int, help="Num request to keep")
     record_parser.add_argument("--timeout", type=int, default=30, help="Timeout to run cli cmds")
+    assert CompactPacker in ALL_PACKERS
+    record_parser.add_argument("--packer", default=CompactPacker.name,
+                               choices=[packer.name for packer in ALL_PACKERS], help="Select command packer")
+    record_parser.add_argument("--min-duration", type=int, default=30,
+                               help="Minimal duration in ms for op to be recorded")
     record_parser.add_argument("--record-cluster", type=int, help="Record cluster info every SECONDS seconds",
                                metavar='SECONDS', default=0)
     record_parser.add_argument("--record-pg-dump", type=int, help="Record cluster pg dump info every SECONDS seconds",
@@ -653,7 +1071,7 @@ def parse_args(argv: List[str]) -> Any:
     return parser.parse_args(argv[1:])
 
 
-def setup_logger(opts):
+def setup_logger(opts: Any) -> None:
     assert opts.log_level in ALLOWED_LOG_LEVELS
     logger.setLevel(getattr(logging, opts.log_level))
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -671,7 +1089,7 @@ def setup_logger(opts):
     logger.addHandler(ch)
 
 
-def main(argv: List[str]):
+def main(argv: List[str]) -> int:
     opts = parse_args(argv)
     setup_logger(opts)
 
@@ -680,7 +1098,11 @@ def main(argv: List[str]):
         return 0
 
     if opts.subparser_name == 'set':
-        set_size_duration(get_ids(), duration=opts.duration, size=opts.size)
+        set_size_duration(get_local_osds(), duration=opts.duration, size=opts.size)
+        return 0
+
+    if opts.subparser_name == 'set_default':
+        set_size_duration(get_local_osds(), duration=DEFAULT_DURATION, size=DEFAULT_SIZE)
         return 0
 
     assert opts.subparser_name == 'record'

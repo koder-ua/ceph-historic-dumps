@@ -6,5 +6,5 @@ After=multi-user.target
 Environment=PYTHONUNBUFFERED=1
 Type=simple
 User={USER}
-ExecStart={PYTHON} /tmp/ceph_ho_dumper.py --log-level DEBUG --log {LOG_FILE} record --duration {DURATION} --size {SIZE} {PRIMARY} {RESULT}
+ExecStart={PYTHON} /tmp/ceph_ho_dumper.py --log-level DEBUG --log {LOG_FILE} record --packer {PACKER} --min-duration {MIN_DURATION} --duration {DURATION} --size {SIZE} {PRIMARY} {RESULT}
 StandardOutput=null

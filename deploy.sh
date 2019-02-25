@@ -10,8 +10,13 @@ readonly COMPRESSOR="lzma --memlimit-compress=1GiB --best --compress --force --k
 readonly PRIMARY_OPTS="--record-cluster 300 --record-pg-dump 1800"
 readonly EXT="lzma"
 
+
+# Tool cli options
+readonly PACKER=raw
+readonly MIN_DURATION=100
 readonly RECORD_DURATION=5
 readonly RECORD_SIZE=100
+
 
 readonly ALL_NODES="ceph01 ceph02 ceph03"
 #ALL_NODES1="ceph01 ceph02 ceph03 ceph04 ceph05 ceph06 ceph07 ceph08 ceph09 ceph10"
@@ -110,8 +115,8 @@ function clean {
         cmd="systemctl stop ${SERVICE} ; rm --force '${SRV_FILE_DST_PATH}' ; systemctl daemon-reload || true"
         do_ssh_sudo "${node}" "${cmd}"
 
-        srv_stat=$(do_ssh_out "${node}" "systemctl status '${SERVICE}' | grep Active || true")
-        if [[ "${srv_stat}" != *" inactive "* ]] ; then
+        is_active=$(do_ssh_out "${node}" "systemctl is-active --quiet '${SERVICE}' ; echo $?")
+        if [[ "${is_active}" != "0" ]] ; then
             printf "%bFailed to stop service on node %s%b\n" "${RED}" "${node}" "${NO_COLOR}"
             code=1
         fi
@@ -165,6 +170,8 @@ function deploy {
 
         srv_file=$(sed --expression "s/{DURATION}/${RECORD_DURATION}/" \
                        --expression "s/{SIZE}/${RECORD_SIZE}/" \
+                       --expression "s/{PACKER}/${PACKER}/" \
+                       --expression "s/{MIN_DURATION}/${MIN_DURATION}/" \
                        --expression "s/{PRIMARY}/${popt}/" \
                        --expression "s/{PYTHON}/${PYTHON//\//\\/}/" \
                        --expression "s/{LOG_FILE}/${LOG//\//\\/}/" \
@@ -184,37 +191,42 @@ function deploy {
     done
 }
 
-function show {
-    local nodes="${1}"
+function show_one_node {
+    local node="${1}"
     local srv_stat
     local log_file_ll
     local log_size
     local pid
 
-    for node in ${nodes} ; do
+    srv_stat=$(do_ssh_out "${node}" "systemctl status ${SERVICE} | grep Active || true")
+    log_file_ll=$(do_ssh_out "${node}" "ls -l '${RESULT}' 2>&1 || true")
 
-        srv_stat=$(do_ssh_out "${node}" "systemctl status ${SERVICE} | grep Active || true")
-        log_file_ll=$(do_ssh_out "${node}" "ls -l '${RESULT}' 2>&1 || true")
+    if [[ "${log_file_ll}" == *"No such file or directory"* ]] ; then
+        log_size="NO FILE"
+    else
+        log_size=$(echo "${log_file_ll}" | awk '{print $5}' | numfmt --to=iec-i --suffix=B)
+    fi
 
-        if [[ "${log_file_ll}" == *"No such file or directory"* ]] ; then
-            log_size="NO FILE"
-        else
-            log_size=$(echo "${log_file_ll}" | awk '{print $5}' | numfmt --to=iec-i --suffix=B)
-        fi
+    pid=$(do_ssh_out "${node}" "systemctl --property=MainPID show ${SERVICE}")
 
-        pid=$(do_ssh_out "${node}" "systemctl --property=MainPID show ${SERVICE}")
-
-        if [[ "${srv_stat}" == *" inactive "* ]] ; then
+    if [[ "${srv_stat}" == *" inactive "* ]] ; then
+        printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${RED}" "${srv_stat}" "${NO_COLOR}" "${log_size}"
+    else
+        if [[ "${srv_stat}" == *" failed "* ]] ; then
             printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${RED}" "${srv_stat}" "${NO_COLOR}" "${log_size}"
         else
-            if [[ "${srv_stat}" == *" failed "* ]] ; then
-                printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${RED}" "${srv_stat}" "${NO_COLOR}" "${log_size}"
-            else
-                printf "%-20s : %b %s %b pid = %s  data_sz = %s\n" \
-                       "${node}" "${GREEN}" "${srv_stat}" "${NO_COLOR}" "${pid:8}" "${log_size}"
-            fi
+            printf "%-20s : %b %s %b pid = %s  data_sz = %s\n" \
+                   "${node}" "${GREEN}" "${srv_stat}" "${NO_COLOR}" "${pid:8}" "${log_size}"
         fi
-    done
+    fi
+}
+
+function show {
+    local nodes="${1}"
+
+    for node in ${nodes} ; do
+        show_one_node "${node}" &
+    done | sort
 }
 
 function stop {
@@ -261,6 +273,22 @@ function collect {
     done
     popd  >/dev/null
 }
+
+
+function split_array {
+    local data="${1}"
+    local len=count
+
+    count="$(echo "${data}" | wc --words)"
+
+    14616627272574
+
+    local max_nodes_per_job=$((nodes_count / jobs))
+    if (( max_nodes_per_job * jobs != nodes_count )); then
+        max_nodes_per_job=$((max_nodes_per_job + 1))
+    fi
+}
+
 
 function collect_parallel {
     local nodes="${1}"
