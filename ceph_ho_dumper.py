@@ -1,7 +1,10 @@
 #!/usr/bin/env python3.5
 import abc
+import bisect
 import logging
 import os
+import pprint
+import re
 import sys
 import bz2
 
@@ -12,6 +15,7 @@ import time
 import zlib
 import heapq
 import socket
+import signal
 import os.path
 import argparse
 import datetime
@@ -53,6 +57,10 @@ assert TARGET_OVERVAL > MAX_TARGET_VL > MIN_TARGET_VL > TARGET_UNDERVAL
 assert UNDISCRETIZE_UNDERVAL <= MIN_SRC_VL < MAX_SRC_VL <= UNDISCRETIZE_OVERVAL
 
 SCALE_COEF = (MAX_TARGET_VL - MIN_TARGET_VL) / (math.log10(MAX_SRC_VL) - math.log10(MIN_SRC_VL))
+STEP_COEF = 1.036824
+
+
+MAX_SLEEP_TIME = 0.01
 
 
 compress = bz2.compress
@@ -95,6 +103,22 @@ class UTExit(Exception):
 
 
 # ----------- UTILS ----------------------------------------------------------------------------------------------------
+
+
+class DiscretizerExt:
+    table = [1]
+    prev = table[-1]
+    for _ in range(255):
+        prev = max(round(STEP_COEF * prev), prev + 1)
+        table.append(prev)
+
+    @classmethod
+    def discretize(cls, vl: float) -> int:
+        return bisect.bisect_left(cls.table, vl)
+
+    @classmethod
+    def undiscretize(cls, vl: int) -> int:
+        return cls.table[vl]
 
 
 def discretize(vl: float) -> int:
@@ -259,8 +283,50 @@ HLTimings = NamedTuple('HLTimings', [("download", int),
                                      ("wait_for_replica", int)])
 
 
+def get_hl_timings(tp: OpType, evt_map: Dict[str, int]) -> HLTimings:
+    qpg_at = evt_map.get("queued_for_pg", -1)
+    started = evt_map.get("started", evt_map.get("reached_pg", -1))
+
+    try:
+        if tp == OpType.write_secondary:
+            local_done = evt_map["sub_op_applied"]
+        elif tp == OpType.write_primary:
+            local_done = evt_map["op_applied"]
+        else:
+            local_done = evt_map["done"]
+    except KeyError:
+        local_done = -1
+
+    last_replica_done = -1
+    subop = -1
+    for evt, tm in evt_map.items():
+        if evt.startswith("waiting for subops from") or evt == "wait_for_subop":
+            last_replica_done = tm
+        elif evt.startswith("sub_op_commit_rec from") or evt == "sub_op_commit_rec":
+            subop = max(tm, subop)
+
+    wait_for_pg = started - qpg_at
+    assert wait_for_pg >= 0
+    local_io = local_done - started
+    assert local_io >= 0
+
+    wait_for_replica = -1
+    if tp in (OpType.write_primary, OpType.write_secondary):
+        download = qpg_at
+        if tp == OpType.write_primary:
+            assert subop != -1
+            assert last_replica_done != -1
+            wait_for_replica = subop - last_replica_done
+    else:
+        download = -1
+
+    return HLTimings(download=download, wait_for_pg=wait_for_pg, local_io=local_io,
+                     wait_for_replica=wait_for_replica)
+
+
 class CephOp:
     def __init__(self,
+                 raw_data: OpRec,
                  description: str,
                  initiated_at: int,
                  tp: Optional[OpType],
@@ -268,6 +334,7 @@ class CephOp:
                  pool_id: int,
                  pg: int,
                  events: List[Tuple[str, int]]) -> None:
+        self.raw_data = raw_data
         self.description = description
         self.initiated_at = initiated_at
         self.tp = tp
@@ -283,6 +350,7 @@ class CephOp:
         initiated_at = to_unix_ms(op['initiated_at'])
         pool, pg = get_pool_pg(op)
         return cls(
+            raw_data=op,
             description=op['description'],
             initiated_at=initiated_at,
             tp=get_type(op),
@@ -292,39 +360,14 @@ class CephOp:
             events=parse_events(op, initiated_at))
 
     def get_hl_timings(self) -> HLTimings:
-        qpg_at = self.evt_map.get("queued_for_pg", -1)
-        started = self.evt_map.get("started", self.evt_map.get("reached_pg", -1))
+        assert self.tp is not None
+        return get_hl_timings(self.tp, self.evt_map)
 
-        try:
-            local_done = self.evt_map["op_applied"] if 'op_applied' in self.evt_map else self.evt_map["done"]
-        except KeyError:
-            local_done = -1
-
-        last_replica_done = -1
-        subop = -1
-        for evt, tm in self.evt_map.items():
-            if evt.startswith("waiting for subops from"):
-                last_replica_done = tm
-            elif evt.startswith("sub_op_commit_rec from"):
-                subop = max(tm, subop)
-
-        wait_for_pg = started - qpg_at
-        assert wait_for_pg >= 0
-        local_io = local_done - started
-        assert local_io >= 0
-
-        wait_for_replica = -1
-        if self.tp in (OpType.write_primary, OpType.write_secondary):
-            download = qpg_at
-            if self.tp == OpType.write_primary:
-                assert subop != -1
-                assert last_replica_done != -1
-                wait_for_replica = subop - last_replica_done
-        else:
-            download = -1
-
-        return HLTimings(download=download, wait_for_pg=wait_for_pg, local_io=local_io,
-                         wait_for_replica=wait_for_replica)
+    def __str__(self) -> str:
+        return ("{description}\n    initiated_at: {initiated_at}\n    tp: {tp}\n    duration: {duration}\n    " +
+                "pool_id: {pool_id}\n    pack_pool_id: {pack_pool_id}\n    pg: {pg}\n    events:\n        "
+                ).format(**self.__dict__) + \
+                "\n        ".join("{}: {}".format(name, tm) for name, tm in sorted(self.evt_map.items()))
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -381,9 +424,15 @@ class IPacker(metaclass=abc.ABCMeta):
                 assert isinstance(ctime, int)
                 assert isinstance(ops, list)
                 assert all(isinstance(rec, CephOp) for rec in ops)
-                packed = b"".join(cls.pack_op(op) for op in ops)
+                packed = []  # type: List[bytes]
+                for op in ops:
+                    try:
+                        packed.append(cls.pack_op(op))
+                    except Exception:
+                        logger.exception("Failed to pack op:\n{}".format(pprint.pformat(op.raw_data)))
+                packed_b = b"".join(packed)
                 if packed:
-                    yield RecId.ops, cls.op_header.pack(osd_id, ctime) + packed
+                    yield RecId.ops, cls.op_header.pack(osd_id, ctime) + packed_b
             else:
                 raise AssertionError("Unknown record type {}".format(rec_tp))
 
@@ -669,7 +718,7 @@ class RawPacker(IPacker):
         if op['tp'] == OpType.write_primary:
             return (("WRITE_PRIMARY     {:>25s}:{:<5x} osd_id={:>4d}   q_for_pg={:>5d}  reached_pg={:>5d}" +
                      "   started={:>5d}   subop={:>5d}   commit={:>5d}   applied={:>5d} subop_ready={:>5d}" +
-                     "  commit={:>5d} done={:>5d}").
+                     "  com_send={:>5d} done={:>5d}").
                     format(op['pool_name'], op['pg'], op['osd_id'], int(op['queued_for_pg']),
                            int(op['reached_pg']),
                            int(op['started']),
@@ -682,8 +731,8 @@ class RawPacker(IPacker):
                            ))
         elif op['tp'] == OpType.write_secondary:
             return (("WRITE_SECONDARY   {:>25s}:{:<5x} osd_id={:>4d}   q_for_pg={:>5d}  reached_pg={:>5d}" +
-                     "   started={:>5d}                 commit={:>5d}   applied={:>5d}" +
-                     "                                 done={:>5d}").
+                     "   started={:>5d}                                applied={:>5d}" +
+                     "                    com_send={:>5d} done={:>5d}").
                     format(op['pool_name'], op['pg'], op['osd_id'], int(op['queued_for_pg']),
                            int(op['reached_pg']),
                            int(op['started']),
@@ -718,24 +767,36 @@ def get_local_osds(target_class: str = None, timeout: int = 15) -> Set[int]:
     # find by node name
     hostnames = {socket.gethostname(), socket.getfqdn()}
 
-    def get_all_child_osds(node: Dict, crush_nodes: Dict[int, Dict]) -> Iterator[int]:
-        if node['type'] == 'osd':
-            if target_class is None or node.get('device_class') == target_class:
-                yield node['id']
-            return
-
-        for ch_id in node['children']:
-            yield from get_all_child_osds(crush_nodes[ch_id], crush_nodes)
-
-    tree_js = subprocess.check_output("ceph osd tree -f json".split(), timeout=timeout).decode("utf8")
-    nodes = {node['id']: node for node in json.loads(tree_js)['nodes']}
+    try:
+        osd_nodes_s = subprocess.check_output("ceph node ls osd -f json".split(), timeout=timeout).decode("utf8")
+    except subprocess.SubprocessError:
+        osd_nodes_s = None
 
     all_osds_by_node_name = None
-    for node in nodes.values():
-        if node['type'] == 'host' and node['name'] in hostnames:
-            assert all_osds_by_node_name is None, \
-                "Current node with names {} found two times in osd tree".format(hostnames)
-            all_osds_by_node_name = set(get_all_child_osds(node, nodes))
+    if osd_nodes_s:
+        osd_nodes = json.loads(osd_nodes_s)
+        for name in hostnames:
+            if name in osd_nodes:
+                all_osds_by_node_name = osd_nodes[name]
+    else:
+        def get_all_child_osds(node: Dict, crush_nodes: Dict[int, Dict]) -> Iterator[int]:
+            # workaround for incorrect node classes on some prod clusters
+            if node['type'] == 'osd' or re.match("osd\.\d+", node['name']):
+                if target_class is None or node.get('device_class') == target_class:
+                    yield node['id']
+                return
+
+            for ch_id in node['children']:
+                yield from get_all_child_osds(crush_nodes[ch_id], crush_nodes)
+
+        tree_js = subprocess.check_output("ceph osd tree -f json".split(), timeout=timeout).decode("utf8")
+        nodes = {node['id']: node for node in json.loads(tree_js)['nodes']}
+
+        for node in nodes.values():
+            if node['type'] == 'host' and node['name'] in hostnames:
+                assert all_osds_by_node_name is None, \
+                    "Current node with names {} found two times in osd tree".format(hostnames)
+                all_osds_by_node_name = set(get_all_child_osds(node, nodes))
 
     if all_osds_by_node_name is not None:
         return all_osds_by_node_name
@@ -751,6 +812,7 @@ def get_local_osds(target_class: str = None, timeout: int = 15) -> Set[int]:
         if public_ip in all_ips or cluster_ip in all_ips:
             if target_class is None or target_class == nodes[osd['id']].get('device_class'):
                 all_osds_by_node_ip.add(osd['id'])
+
     return all_osds_by_node_ip
 
 
@@ -788,7 +850,11 @@ CEPH_DF = 'ceph df -f json'
 CEPH_S = 'ceph -s -f json'
 
 
-def dump_cluster_info(commands: List[str], timeout: float = 15) -> Optional[List[Tuple[RecId, Dict[str, str]]]]:
+FileRec = Tuple[RecId, Any]
+BinaryFileRec = Tuple[RecId, bytes]
+
+
+def dump_cluster_info(commands: List[str], timeout: float = 15) -> List[FileRec]:
     """
     make a message with provided cmd outputs
     """
@@ -802,7 +868,7 @@ def dump_cluster_info(commands: List[str], timeout: float = 15) -> Optional[List
     if output:
         return [(RecId.cluster_info, output)]
 
-    return None  # make mypy happy
+    return []
 
 
 class CephDumper:
@@ -832,7 +898,7 @@ class CephDumper:
             return True
         return False
 
-    def dump_historic(self) -> Iterator[Tuple[RecId, Any]]:
+    def dump_historic(self) -> List[FileRec]:
         if self.not_inited_osd:
             self.not_inited_osd = set_size_duration(self.not_inited_osd, self.size, self.duration,
                                                     timeout=self.cmd_tout)
@@ -849,12 +915,13 @@ class CephDumper:
                     self.not_inited_osd.add(osd_id)
                     continue
 
+        result = []  # type: List[FileRec]
         if self.reload_pools():
             if self.first_cycle:
-                yield RecId.pools, self.pools_map
+                result.append((RecId.pools, self.pools_map))
             else:
                 # pools updated - skip this cycle, as different ops may came from pools before and after update
-                return
+                return []
 
         for osd_id, data in osd_ops.items():
             try:
@@ -866,7 +933,14 @@ class CephDumper:
                 self.not_inited_osd.add(osd_id)
                 continue
 
-            ops = [CephOp.parse_op(op) for op in parsed['ops']]
+            ops = []
+            for op in parsed['ops']:
+                try:
+                    if get_type(op) is not None:
+                        ops.append(CephOp.parse_op(op))
+                except Exception:
+                    logger.exception("Failed to parse op: {}".format(pprint.pformat(op)))
+
             ops = [op for op in ops if op.tp is not None and op.description not in self.last_time_ops[osd_id]]
             if self.min_duration:
                 ops = [op for op in ops if op.duration >= self.min_duration]
@@ -876,70 +950,130 @@ class CephDumper:
                 assert op.pack_pool_id is None
                 op.pack_pool_id = self.pools_map_no_name[op.pool_id]
 
-            yield RecId.ops, (osd_id, ctime, ops)
+            result.append((RecId.ops, (osd_id, ctime, ops)))
+
+        return result
 
 
-InfoFunc = Callable[[], Iterator[Tuple[RecId, Any]]]
+InfoFunc = Callable[[], List[FileRec]]
+BinInfoFunc = Callable[[], List[BinaryFileRec]]
 
 
-def thread_func(handler: InfoFunc, packer: IPacker) -> List[Tuple[RecId, bytes]]:
+def thread_func(handler: InfoFunc, packer: IPacker) -> List[BinaryFileRec]:
     return list(packer.pack_iter(handler()))
 
 
-def dump_loop(opts: Any, osd_ids: Set[int], fd: BinaryIO) -> None:
-    handlers = []  # type: List[Tuple[str, InfoFunc, float]]
+class DumpLoop:
+    sigusr_requested_handlers = ["cluster_info", "pg_dump"]
 
-    packer = get_packer(opts.packer)
+    def __init__(self, opts: Any, osd_ids: Set[int], fd: BinaryIO) -> None:
+        self.opts = opts
+        self.osd_ids = osd_ids
+        self.fd = fd
+        self.dump_requested = False
+        self.packer = get_packer(opts.packer)
 
-    if opts.record_cluster != 0:
-        func = partial(dump_cluster_info, (RADOS_DF, CEPH_DF, CEPH_S), opts.timeout)  # type: ignore
-        func = partial(thread_func, func, packer)  # type: ignore
-        handlers.append(("cluster_info", func, opts.record_cluster))  # type: ignore
+        self.handlers = []  # type: List[Tuple[str, BinInfoFunc, float]]
+        self.fill_handlers()
 
-    if opts.record_pg_dump != 0:
-        func = partial(dump_cluster_info, (PG_DUMP,), opts.timeout)  # type: ignore
-        func = partial(thread_func, func, packer)  # type: ignore
-        handlers.append(("pg_dump", func, opts.record_pg_dump))  # type: ignore
-
-    dumper = CephDumper(osd_ids, opts.size, opts.duration, opts.timeout, opts.min_duration)
-
-    func = partial(thread_func, dumper.dump_historic, packer)  # type: ignore
-    handlers.append(("historic", func, opts.duration))  # type: ignore
-
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(handlers))
-    futures = {}  # type: Dict[concurrent.futures.Future, Tuple[int, float, float]]
-
-    ctime = time.time()
-    handlers_q = [(ctime, idx) for idx in range(len(handlers))]
-    heapq.heapify(handlers_q)
-
-    while True:
-        stime = handlers_q[0][0] - ctime if handlers_q else 0.5
-
-        if futures:
-            done, _ = concurrent.futures.wait(list(futures.keys()),
-                                              timeout=stime,
-                                              return_when=concurrent.futures.FIRST_COMPLETED)
-            for fut in done:
-                idx, prev_time, next_time = futures.pop(fut)
-                name, _, tout = handlers[idx]
-                for rec_id, data in fut.result(timeout=0):
-                    logger.debug("Handler %s provides %s bytes of data of type %s", name, len(data), rec_id)
-                    write_record(fd, rec_id, data)
-
-                ctime = time.time()
-                if next_time - ctime < ctime - prev_time:
-                    next_time = ctime + tout
-                heapq.heappush(handlers_q, (next_time, idx))
-        else:
-            time.sleep(stime)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(self.handlers))
 
         ctime = time.time()
-        if handlers_q and handlers_q[0][0] <= ctime:
-            stime, idx = heapq.heappop(handlers_q)
-            _, handler, tout = handlers[idx]
-            future = executor.submit(handler)
-            futures[future] = (idx, stime, stime + tout)
+        self.handlers_q = [(ctime, idx) for idx in range(len(self.handlers))]
+        heapq.heapify(self.handlers_q)
+
+        # Future -> HANDLER_IDX, FUTURE_START_TIME, FUTURE_NEXT_START_TIME
+        self.futures = {}  # type: Dict[concurrent.futures.Future, Tuple[int, float, float]]
+        signal.signal(signal.SIGUSR1, self.sigusr1_handler)
+
+    def sigusr1_handler(self, signum: Any, frame: Any) -> None:
+        logger.info("Get SIGUSR1, will dump data")
+        self.dump_requested = True
+
+    def fill_handlers(self) -> None:
+        if self.opts.record_cluster != 0:
+            func = partial(dump_cluster_info, (RADOS_DF, CEPH_DF, CEPH_S), self.opts.timeout)  # type: InfoFunc
+            th_func = partial(thread_func, func, self.packer)  # type: BinInfoFunc
+            self.handlers.append(("cluster_info", th_func, self.opts.record_cluster))
+
+        if self.opts.record_pg_dump != 0:
+            func = partial(dump_cluster_info, (PG_DUMP,), self.opts.timeout)
+            th_func = partial(thread_func, func, self.packer)
+            self.handlers.append(("pg_dump", th_func, self.opts.record_pg_dump))
+
+        dumper = CephDumper(self.osd_ids, self.opts.size, self.opts.duration, self.opts.timeout, self.opts.min_duration)
+
+        func = partial(thread_func, dumper.dump_historic, self.packer)
+        self.handlers.append(("historic", func, self.opts.duration))
+
+    def process_futures(self, max_time: float) -> None:
+        done, _ = concurrent.futures.wait(list(self.futures.keys()),
+                                          timeout=max_time,
+                                          return_when=concurrent.futures.FIRST_COMPLETED)
+        for fut in done:
+            idx, prev_time, next_time = self.futures.pop(fut)
+            name, _, tout = self.handlers[idx]
+            for rec_id, data in fut.result(timeout=0):
+                logger.debug("Handler %s provides %s bytes of data of type %s", name, len(data), rec_id)
+                write_record(self.fd, rec_id, data)
+
+            ctime = time.time()
+            if next_time - ctime < ctime - prev_time:
+                next_time = ctime + tout
+            heapq.heappush(self.handlers_q, (next_time, idx))
+
+    def schedule_handler(self, idx: int, curr_time: float) -> None:
+        _, func, tout = self.handlers[idx]
+        future = self.executor.submit(func)
+        self.futures[future] = (idx, curr_time, curr_time + tout)
+
+    def dump_all_info(self) -> None:
+        # call all info handlers due to user request
+        logger.info("Dumping data due to user request")
+        new_q = []
+
+        curr_time = time.time()
+        for call_time, idx in self.handlers_q:
+            name, func, tout = self.handlers[idx]
+            if name in self.sigusr_requested_handlers:
+                self.schedule_handler(idx, curr_time)
+            else:
+                new_q.append((call_time, idx))
+
+        self.handlers_q = new_q
+        heapq.heapify(self.handlers_q)
+
+    def mainloop_one_cycle(self, max_time: float) -> None:
+        ctime = time.time()
+        stop_time = ctime + max_time
+        wtime_left = stop_time - ctime
+
+        while wtime_left >= 0:
+            loop_time = min(wtime_left, MAX_SLEEP_TIME)
+            loop_end_time = time.time() + loop_time
+            self.process_futures(loop_time)
+
+            if self.dump_requested:
+                self.dump_all_info()
+                self.dump_requested = False
+
+            # start handlers
+            ctime = time.time()
+            if self.handlers_q and self.handlers_q[0][0] <= ctime:
+                call_time, idx = heapq.heappop(self.handlers_q)
+                self.schedule_handler(idx, ctime)
+
+            loop_time_left = loop_end_time - ctime
+            if loop_time_left > 0:
+                time.sleep(loop_time_left)
+
+            wtime_left = stop_time - time.time()
+
+
+def dump_loop(opts: Any, osd_ids: Set[int], fd: BinaryIO) -> None:
+    looper = DumpLoop(opts, osd_ids, fd)
+    while True:
+        looper.mainloop_one_cycle(1)
 
 
 def seek_to_last_valid_record(fd: BinaryIO) -> Optional[bytes]:
@@ -1071,27 +1205,27 @@ def parse_args(argv: List[str]) -> Any:
     return parser.parse_args(argv[1:])
 
 
-def setup_logger(opts: Any) -> None:
-    assert opts.log_level in ALLOWED_LOG_LEVELS
-    logger.setLevel(getattr(logging, opts.log_level))
+def setup_logger(configurable_logger: logging.Logger, log_level: str, log: str = None) -> None:
+    assert log_level in ALLOWED_LOG_LEVELS
+    configurable_logger.setLevel(getattr(logging, log_level))
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     ch = logging.StreamHandler()
-    ch.setLevel(getattr(logging, opts.log_level))
+    ch.setLevel(getattr(logging, log_level))
     ch.setFormatter(formatter)
 
-    if opts.log:
-        fh = logging.FileHandler(opts.log)
+    if log:
+        fh = logging.FileHandler(log)
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(formatter)
-        logger.addHandler(fh)
+        configurable_logger.addHandler(fh)
 
-    logger.addHandler(ch)
+    configurable_logger.addHandler(ch)
 
 
 def main(argv: List[str]) -> int:
     opts = parse_args(argv)
-    setup_logger(opts)
+    setup_logger(logger, opts.log_level, opts.log)
 
     if opts.subparser_name == 'parse':
         print_records_from_file(opts.file, opts.limit)
