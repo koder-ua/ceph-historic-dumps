@@ -14,9 +14,9 @@ readonly EXT="lzma"
 
 # Tool options
 readonly PACKER=raw
-readonly MIN_DURATION=30
-readonly RECORD_DURATION=60
-readonly RECORD_SIZE=300
+readonly MIN_DURATION=5
+readonly RECORD_DURATION=10
+readonly RECORD_SIZE=50
 readonly DEFAULT_TAIL_LINES=20
 readonly PRIMARY_OPTS="--record-cluster 300 --record-pg-dump 1800"
 

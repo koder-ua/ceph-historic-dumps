@@ -1094,7 +1094,8 @@ def seek_to_last_valid_record(fd: BinaryIO) -> Optional[bytes]:
 
 def record_to_file(opts: Any) -> int:
     logger.info("Start recording with opts = %s", " ".join(sys.argv))
-    params = {'packer': opts.packer, 'cmd': sys.argv}
+    params = {'packer': opts.packer, 'cmd': sys.argv,
+              'node': [socket.gethostname(), socket.getfqdn()]}
     try:
         osd_ids = get_local_osds()
         logger.info("osds = %s", osd_ids)
