@@ -29,7 +29,7 @@ readonly ALL_NODES="ceph01 ceph02 ceph03"
 
 # ALMOST CONSTANT
 readonly PYTHON="/usr/bin/python3.5"
-readonly BIN=ceph_ho_dumper.py
+readonly BIN=ceph_ho_dumper_async.py
 readonly TARGET="/tmp/${BIN}"
 readonly SHELL="/bin/bash"
 readonly LOG=/tmp/ceph_ho_dumper.log
@@ -238,6 +238,7 @@ function deploy {
                        --expression "s/{MIN_DURATION}/${MIN_DURATION}/" \
                        --expression "s/{PRIMARY}/${popt}/" \
                        --expression "s/{PYTHON}/${PYTHON//\//\\/}/" \
+                       --expression "s/{PY_FILE}/${TARGET//\//\\/}/" \
                        --expression "s/{LOG_FILE}/${LOG//\//\\/}/" \
                        --expression "s/{USER}/${TARGET_USER}/" \
                        --expression "s/{RESULT}/${RESULT//\//\\/}/" < "${SRV_FILE}")

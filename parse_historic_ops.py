@@ -340,21 +340,27 @@ class LogInfo(NamedTuple):
     info: ClusterInfo
     pg_dump: pandas.DataFrame
     pg_dump_times: List[int]
+    pool_info: pandas.DataFrame
+    pool_info_times: List[int]
 
     def store(self, storage: StorageType):
         storage['data'] = self.data
         self.info.store(storage)
         storage['pg_dump'] = self.pg_dump
         storage['pg_dump_time'] = pandas.Series(self.pg_dump_times)
+        storage['pool_info'] = pandas.Series(self.pool_info)
+        storage['pool_info_times'] = pandas.Series(self.pool_info_times)
 
     @classmethod
     def load(cls, storage: StorageType) -> 'LogInfo':
         data = storage['data']
         info = ClusterInfo.load(storage)
         data['node'] = [info.osd2node.get(osd_id) for osd_id in data['osd_id']]
-        return cls(data, info,
+        return cls(data=data, info=info,
                    pg_dump=storage['pg_dump'],
-                   pg_dump_times=list(storage['pg_dump_time']))
+                   pg_dump_times=list(storage['pg_dump_time']),
+                   pool_info=storage['pool_info'],
+                   pool_info_times=list(storage['pool_info_times']))
 
 
 def load_hdf(fname: str) -> LogInfo:
@@ -368,6 +374,9 @@ def iterate_op_records(fnames: List[str]) -> Iterator[Tuple[ceph_ho_dumper.RecId
         with open(fname, 'rb') as fd:
             # yield from ceph_ho_dumper.parse(fd)
             for rec_id, op in ceph_ho_dumper.parse(fd):
+                if rec_id == ceph_ho_dumper.RecId.params:
+                    if 'hostname' not in op:
+                        op['hostname'] = fname.split('-', 1)[0]
                 if rec_id == ceph_ho_dumper.RecId.params:
                     if 'hostname' not in op:
                         op['hostname'] = fname.split('-', 1)[0]
@@ -395,25 +404,38 @@ def extract_from_pgdump(data: Dict[str, Any]) -> Tuple[int, Dict[str, List[int]]
     return ctime, res
 
 
+def extract_from_pool_df(data: Dict[str, Any]) -> Dict[str, Union[List[str], List[int]]]:
+    res: Dict[str, List[int]] = collections.defaultdict(list)
+
+    for pool_info in data["pools"]:
+        for name, val in pool_info.items():
+            res[name].append(val)
+
+    return res
+
+
 def parse_logs_to_pd(ops_iterator: Iterable[Tuple[ceph_ho_dumper.RecId, Any]]) -> LogInfo:
 
-    osd_ids = []
-    durations = []
-    op_types = []
-    pools = []
-    pgs = []
+    osd_ids: List[int] = []
+    durations: List[int] = []
+    op_types: List[int] = []
+    pools: List[int] = []
+    pgs: List[int] = []
 
-    local_io = []
-    wait_for_pg = []
-    download = []
-    wait_for_replica = []
+    local_io: List[int] = []
+    wait_for_pg: List[int] = []
+    download: List[int] = []
+    wait_for_replica: List[int] = []
+    rec_time: List[int] = []
 
     supported_types = (ceph_ho_dumper.OpType.read,
                        ceph_ho_dumper.OpType.write_secondary,
                        ceph_ho_dumper.OpType.write_primary)
 
     pg_info: Dict[str, List[int]] = collections.defaultdict(list)
-    pg_dump_ctimes: List[int] = []
+    pg_dump_times: List[int] = []
+    pool_info: Dict[str, Union[List[int], List[int]]] = collections.defaultdict(list)
+    pool_info_times: List[int] = []
 
     pool_id2name: Dict[int, str] = {}
     hostname: Optional[str] = None
@@ -422,7 +444,7 @@ def parse_logs_to_pd(ops_iterator: Iterable[Tuple[ceph_ho_dumper.RecId, Any]]) -
     prev = 0
 
     for op_tp, params in ops_iterator:
-        if len(durations) // 1000000!= prev // 1000000:
+        if len(durations) // 1000000 != prev // 1000000:
             logger.debug(f"{len(durations) // 1000000:,} millions of records processed")
         prev = len(durations)
         if op_tp == ceph_ho_dumper.RecId.ops:
@@ -458,6 +480,7 @@ def parse_logs_to_pd(ops_iterator: Iterable[Tuple[ceph_ho_dumper.RecId, Any]]) -
                 wait_for_pg.append(wait_for_pg_tm)
                 download.append(download_tm)
                 wait_for_replica.append(wait_for_replica_tm)
+                rec_time.append(op['time'])
         elif op_tp == ceph_ho_dumper.RecId.params:
             hostname = params['hostname']
         elif op_tp == ceph_ho_dumper.RecId.params:
@@ -465,9 +488,20 @@ def parse_logs_to_pd(ops_iterator: Iterable[Tuple[ceph_ho_dumper.RecId, Any]]) -
                 ctime, new_pg_data = extract_from_pgdump(params[ceph_ho_dumper.PG_DUMP])
                 for name, vals in new_pg_data.items():
                     pg_info[name].extend(vals)
-                pg_dump_ctimes.append(ctime)
+                pg_dump_times.append(ctime)
 
-            hostname = params['hostname']
+            if ceph_ho_dumper.RADOS_DF in params:
+                new_pool_data = extract_from_pool_df(params[ceph_ho_dumper.RADOS_DF])
+                data_len = None
+                for name, vals in new_pool_data.items():
+                    pool_info[name].extend(vals)
+                    if data_len is None:
+                        data_len = len(vals)
+                    else:
+                        assert data_len == len(vals)
+
+                if data_len:
+                    pool_info_times.extend([params.get('time', 0)] * data_len)
 
     logger.info(f"{len(durations):,} total record processed")
 
@@ -481,10 +515,15 @@ def parse_logs_to_pd(ops_iterator: Iterable[Tuple[ceph_ho_dumper.RecId, Any]]) -
         'duration': numpy.array(durations, dtype=numpy.uint32),
         'op_type': numpy.array(op_types, dtype=numpy.uint8),
         'pool': numpy.array(pools, dtype=numpy.uint8),
-        'pg': numpy.array(pgs, dtype=numpy.uint32)
+        'pg': numpy.array(pgs, dtype=numpy.uint32),
+        'time': numpy.array(rec_time, dtype=numpy.uint32)
     })
 
-    return LogInfo(data, cluster_info, pandas.DataFrame(pg_info), pg_dump_ctimes)
+    return LogInfo(data, cluster_info,
+                   pg_dump=pandas.DataFrame(pg_info),
+                   pg_dump_times=pg_dump_times,
+                   pool_info=pandas.DataFrame(pool_info),
+                   pool_info_times=pool_info_times)
 
 
 # -----------   PLOT FUNCTIONS  ----------------------------------------------------------------------------------------
