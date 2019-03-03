@@ -5,13 +5,6 @@ set -o errexit
 
 # CONFIGURABLE
 
-#readonly COMPRESSOR="gzip -f -k"
-#readonly EXT="gz"
-
-readonly COMPRESSOR="lzma --memlimit-compress=1GiB --best --compress --force --keep"
-readonly EXT="lzma"
-
-
 # Tool options
 readonly PACKER=raw
 readonly MIN_DURATION=5
@@ -369,9 +362,7 @@ function collect {
 
     pushd "${target_dir}" >/dev/null
     for node in ${nodes} ; do
-        do_ssh "${node}" "${COMPRESSOR} '${RESULT}'"
-        do_scp "${node}:${RESULT}.${EXT}" "${node}-${result_basename}.${EXT}"
-        do_ssh "${node}" "rm --force '${RESULT}.${EXT}'"
+        do_scp "${node}:${RESULT}" "${node}-${result_basename}"
     done
     popd  >/dev/null
 }

@@ -1,2 +1,2 @@
 * store client ID for op
-
+* record osd performance metrics
