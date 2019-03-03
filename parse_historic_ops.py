@@ -17,7 +17,7 @@ import matplotlib
 from matplotlib import pyplot
 from dataclasses import dataclass, field
 
-import ceph_ho_dumper
+import ceph_ho_dumper_async as ceph_ho_dumper
 
 
 matplotlib.rcParams.update({'font.size': 30, 'lines.linewidth': 5})

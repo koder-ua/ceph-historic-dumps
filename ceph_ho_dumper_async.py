@@ -4,6 +4,8 @@ import re
 import sys
 import bz2
 import abc
+from io import BytesIO
+
 import math
 import stat
 import json
@@ -76,6 +78,7 @@ class RecId(Enum):
     pools = 2
     cluster_info = 3
     params = 4
+    packed = 5
 
 
 HEADER_V11 = b"OSD OPS LOG v1.1\0"
@@ -164,68 +167,130 @@ def open_to_append(fname: str, is_bin: bool = False) -> Union[BinaryIO, TextIO]:
 # ----------------------  file records operating functions -------------------------------------------------------------
 
 
-rec_header = Struct("!II")
+class RecordFile:
+    rec_header = Struct("!II")
 
+    def __init__(self, fd: BinaryIO, pack_each: int = 2 ** 20,
+                 packer: Tuple[Callable[[bytes], bytes], Callable[[bytes], bytes]] = (compress, decompress)) -> None:
+        if pack_each != 0:
+            assert fd.seekable()
 
-def write_record(fd: BinaryIO, rec_type: RecId, data: bytes, flush: bool = True) -> None:
-    """
-    Write variable-size record to file along with checksum
-    """
-    id_bt = bytes((rec_type.value,))
-    checksum = zlib.adler32(data, zlib.adler32(id_bt))
-    fd.write(rec_header.pack(checksum, len(data) + 1) + id_bt)
-    fd.write(data)
-    if flush:
-        fd.flush()
+        self.fd = fd
+        self.pack_each = pack_each
+        self.compress, self.decompress = packer
+        self.cached = []
+        self.cache_size = 0
+        self.unpacked_offset = 0
 
+    def tell(self) -> int:
+        return self.fd.tell()
 
-def iter_records(fd: BinaryIO) -> Iterator[Tuple[RecId, bytes]]:
-    """
-    iterate over records in output file, written with write_record function
-    """
+    def read_file_header(self) -> Optional[bytes]:
+        """
+        read header from file, return fd positioned to first byte after the header
+        check that header is in supported headers, fail otherwise
+        must be called from offset 0
+        """
+        assert self.fd.seekable()
+        assert self.fd.tell() == 0, "read_file_header must be called from beginning of the file"
+        self.fd.seek(0, os.SEEK_END)
+        size = self.fd.tell()
+        if size == 0:
+            return None
 
-    rec_size = rec_header.size
-    unpack = rec_header.unpack
+        assert self.fd.readable()
+        self.fd.seek(0, os.SEEK_SET)
+        assert size >= HEADER_LEN, "Incorrect header"
+        hdr = self.fd.read(HEADER_LEN)
+        assert hdr in ALL_SUPPORTED_HEADERS, "Unknown header {!r}".format(hdr)
+        return hdr
 
-    offset = fd.tell()
-    fd.seek(0, os.SEEK_END)
-    size = fd.tell()
-    fd.seek(offset, os.SEEK_SET)
+    def make_header_for_rec(self, rec_type: RecId, data: bytes):
+        id_bt = bytes((rec_type.value,))
+        checksum = zlib.adler32(data, zlib.adler32(id_bt))
+        return self.rec_header.pack(checksum, len(data) + 1) + id_bt
 
-    try:
-        while offset < size:
-            data = fd.read(rec_size)
-            if len(data) != rec_size:
-                raise UnexpectedEOF()
-            checksum, data_size = unpack(data)
-            data = fd.read(data_size)
-            if len(data) != data_size:
-                raise UnexpectedEOF()
-            assert checksum == zlib.adler32(data), "record corrupted at offset {}".format(offset)
-            yield RecId(data[0]), data[1:]
-            offset += rec_size + data_size
-    except Exception:
-        fd.seek(offset, os.SEEK_SET)
-        raise
+    def write_record(self, rec_type: RecId, data: bytes, flush: bool = True) -> None:
+        header = self.make_header_for_rec(rec_type, data)
+        truncate = False
 
+        if self.pack_each != 0:
+            if self.cache_size == 0:
+                self.unpacked_offset = self.fd.tell()
 
-def read_header(fd: BinaryIO) -> Optional[bytes]:
-    """
-    read header from file, return fd positioned to first byte after the header
-    check that header is in supported headers, fail otherwise
-    must be called from offset 0
-    """
-    assert fd.tell() == 0, "read_header must be called from beginning of the file"
-    fd.seek(0, os.SEEK_END)
-    size = fd.tell()
-    if size == 0:
-        return None
+            self.cached.extend([header, data])
+            self.cache_size += len(header) + len(data)
 
-    fd.seek(0, os.SEEK_SET)
-    assert size >= HEADER_LEN, "Incorrect header"
-    hdr = fd.read(HEADER_LEN)
-    assert hdr in ALL_SUPPORTED_HEADERS, "Unknown header {!r}".format(hdr)
-    return hdr
+            if self.cache_size >= self.pack_each:
+                data = self.compress(b"".join(self.cached))
+                header = self.make_header_for_rec(RecId.packed, data)
+                logger.debug("Repack data orig size=%sKiB new_size=%sKiB",
+                             self.cache_size // 1024, (len(header) + len(data)) // 1024)
+                self.cached = []
+                self.cache_size = 0
+                self.fd.seek(self.unpacked_offset)
+                truncate = True
+                self.unpacked_offset = self.fd.tell()
+
+        self.fd.write(header)
+        self.fd.write(data)
+        if truncate:
+            self.fd.truncate()
+
+        if flush:
+            self.fd.flush()
+
+    def iter_records(self) -> Iterator[Tuple[RecId, bytes]]:
+        """
+        iterate over records in output file, written with write_record function
+        """
+
+        rec_size = self.rec_header.size
+        unpack = self.rec_header.unpack
+
+        offset = self.fd.tell()
+        self.fd.seek(0, os.SEEK_END)
+        size = self.fd.tell()
+        self.fd.seek(offset, os.SEEK_SET)
+
+        try:
+            while offset < size:
+                data = self.fd.read(rec_size)
+                if len(data) != rec_size:
+                    raise UnexpectedEOF()
+                checksum, data_size = unpack(data)
+                data = self.fd.read(data_size)
+                if len(data) != data_size:
+                    raise UnexpectedEOF()
+                assert checksum == zlib.adler32(data), "record corrupted at offset {}".format(offset)
+
+                rec_id = RecId(data[0])
+                data = data[1:]
+
+                if rec_id == RecId.packed:
+                    yield from RecordFile(BytesIO(self.decompress(data))).iter_records()  # type: ignore
+                else:
+                    yield rec_id, data
+
+                offset += rec_size + data_size
+        except Exception:
+            self.fd.seek(offset, os.SEEK_SET)
+            raise
+
+    def seek_to_last_valid_record(self) -> Optional[bytes]:
+        header = self.read_file_header()
+
+        if header is None:
+            return None
+
+        try:
+            for _ in self.iter_records():
+                pass
+        except (UnexpectedEOF, AssertionError, ValueError):
+            logger.warning("File corrupted after offset %d. Truncate to last valid offset", self.fd.tell())
+            self.fd.truncate()
+
+        return header
 
 
 # -------------------------   historic ops helpers ---------------------------------------------------------------------
@@ -755,7 +820,7 @@ def get_packer(name: str) -> Type[IPacker]:
 # --------- CEPH UTILS -------------------------------------------------------------------------------------------------
 
 
-async def subprocess_output(cmd: str, shell: bool = False, timeout: int = 15) -> Awaitable[str]:
+async def subprocess_output(cmd: str, shell: bool = False, timeout: float = 15) -> Awaitable[str]:
     if shell:
         proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE,
                                                      stderr=asyncio.subprocess.STDOUT)
@@ -993,14 +1058,10 @@ class CephDumper:
 BinInfoFunc = Callable[[], List[BinaryFileRec]]
 
 
-async def thread_func(handler, packer: IPacker) -> List[BinaryFileRec]:
-    return list()
-
-
 class DumpLoop:
     sigusr_requested_handlers = ["cluster_info", "pg_dump"]
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, opts: Any, osd_ids: Set[int], fd: BinaryIO) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop, opts: Any, osd_ids: Set[int], fd: RecordFile) -> None:
         self.opts = opts
         self.osd_ids = osd_ids
         self.fd = fd
@@ -1054,7 +1115,7 @@ class DumpLoop:
 
             for rec_id, packed in self.packer.pack_iter(data):
                 logger.debug("Handler %s provides %s bytes of data of type %s", name, len(packed), rec_id)
-                write_record(self.fd, rec_id, packed)
+                self.fd.write_record(rec_id, packed)
 
         if repeat:
             handler, tout, next_time = self.handlers[name]
@@ -1078,22 +1139,6 @@ class DumpLoop:
                 self.start_handler(name)
 
 
-def seek_to_last_valid_record(fd: BinaryIO) -> Optional[bytes]:
-    header = read_header(fd)
-
-    if header is None:
-        return None
-
-    try:
-        for _ in iter_records(fd):
-            pass
-    except (UnexpectedEOF, AssertionError, ValueError):
-        logger.warning("File corrupted after offset %d. Truncate to last valid offset", fd.tell())
-        fd.truncate()
-
-    return header
-
-
 async def record_to_file(loop: asyncio.AbstractEventLoop, opts: Any) -> Awaitable[int]:
     logger.info("Start recording with opts = %s", " ".join(sys.argv))
     params = {'packer': opts.packer, 'cmd': sys.argv,
@@ -1102,17 +1147,18 @@ async def record_to_file(loop: asyncio.AbstractEventLoop, opts: Any) -> Awaitabl
         osd_ids = await get_local_osds()
         logger.info("osds = %s", osd_ids)
 
-        with cast(BinaryIO, open_to_append(opts.output_file, True)) as fd:
-            fd.seek(0, os.SEEK_SET)
-            header = seek_to_last_valid_record(fd)
+        with cast(BinaryIO, open_to_append(opts.output_file, True)) as os_fd:
+            os_fd.seek(0, os.SEEK_SET)
+            fd = RecordFile(os_fd)
+            header = fd.seek_to_last_valid_record()
 
             if header is None:
-                fd.seek(0, os.SEEK_SET)
-                fd.write(HEADER_LAST)
+                os_fd.seek(0, os.SEEK_SET)
+                os_fd.write(HEADER_LAST)
             else:
                 assert header == HEADER_LAST, "Can only append to file with {} version".format(HEADER_LAST_NAME)
 
-            write_record(fd, RecId.params, json.dumps(params).encode("utf8"))
+            fd.write_record(RecId.params, json.dumps(params).encode("utf8"))
             DumpLoop(loop, opts, osd_ids, fd).start()
             while True:
                 await asyncio.sleep(0.1)
@@ -1128,8 +1174,9 @@ async def record_to_file(loop: asyncio.AbstractEventLoop, opts: Any) -> Awaitabl
     return 0
 
 
-def parse(fd: BinaryIO) -> Iterator[Tuple[RecId, Any]]:
-    header = read_header(fd)
+def parse(os_fd: BinaryIO) -> Iterator[Tuple[RecId, Any]]:
+    fd = RecordFile(os_fd)
+    header = fd.read_file_header()
     if header is None:
         return
 
@@ -1137,7 +1184,7 @@ def parse(fd: BinaryIO) -> Iterator[Tuple[RecId, Any]]:
     if header == HEADER_V11:
         packer = CompactPacker
 
-    riter = iter_records(fd)
+    riter = fd.iter_records()
     pools_map = None  # type: Optional[Dict[int, Tuple[str, int]]]
 
     for rec_type, data in riter:
