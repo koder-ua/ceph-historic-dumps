@@ -330,29 +330,7 @@ function restart {
 
 function force_dump_info {
     local -r node="${1}"
-    local -r wait="${2}"
-    local new_size
-    local origin_size
-
-    if [[ "${wait}" == "1" ]] ; then
-        origin_size=$(get_record_file_size "${node}")
-        if [[ "${origin_size}" == "" ]] ; then
-            origin_size=0
-        fi
-    fi
     do_ssh_sudo "${node}" "systemctl kill -s ${FORCE_DUMP_SIGNAL} ${SERVICE}"
-
-    if [[ "${wait}" == "1" ]] ; then
-        echo "Waiting for record file to be updated on node ${node}"
-        local -r end_time=$(($(date +%s) + MAX_LOG_UPDATE_WAIT_TIME))
-        while [[ "$(date +%s)" < "${end_time}" ]] ; do
-            new_size=$(get_record_file_size "${node}")
-            if ((origin_size + MIN_DUMP_SIZE_DIFF < new_size)) ; then
-                break
-            fi
-            sleep 5
-        done
-    fi
 }
 
 function collect {
@@ -383,7 +361,6 @@ function main {
     local parallel="0"
     local parallel_prefix=""
     local no_dump_info="0"
-    local wait="0"
 
     local -r command="${1}"
     shift
@@ -407,9 +384,6 @@ function main {
             ;;
         --no-dump-info)
             no_dump_info="1"
-            ;;
-        --wait)
-            wait="1"
             ;;
         esac
         shift
@@ -440,7 +414,9 @@ function main {
         ;;
     -l|--collect)
         if [[ "${no_dump_info}" == "0" ]] ; then
-            force_dump_info "${first_node}" "1"
+            force_dump_info "${first_node}"
+            echo "Waiting for 15s for primary node to complete PG dump"
+            sleep 15
         fi
 
         if [[ "${tgt}" != "" ]] && [[ ! -d "${tgt}" ]] ; then
@@ -463,7 +439,7 @@ function main {
         fi
         ;;
     -f|--force-dump-info)
-        force_dump_info "${first_node}" "${wait}"
+        force_dump_info "${first_node}"
         ;;
     -t|--tail)
         if [[ "${parallel}" == "1" ]] ; then
