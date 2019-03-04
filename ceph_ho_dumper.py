@@ -28,7 +28,7 @@ from collections import defaultdict
 
 from typing.io import BinaryIO, TextIO
 from typing import List, Dict, Tuple, Iterator, Any, Optional, Union, Callable, Set, Type, cast, NewType, NamedTuple, \
-    Iterable, Awaitable
+    Iterable, Awaitable, Match
 
 logger = logging.getLogger('ops dumper')
 
@@ -304,37 +304,80 @@ def parse_events(op: OpRec, initiated_at: int) -> List[Tuple[str, int]]:
             for evt in op["type_data"]["events"] if evt["event"] != "initiated"]
 
 
-def get_type(op: OpRec) -> Optional[OpType]:
-    """
-    Get type for operation
-    """
-    description = op['description']
-    op_type_s, _ = description.split("(", 1)
-
-    is_read = is_write = False
-
-    if '+write+' in description:
-        is_write = True
-    elif '+read+' in description:
-        is_read = True
-
-    if op_type_s == 'osd_op':
-        if is_write:
-            return OpType.write_primary
-        if is_read:
-            return OpType.read
-    elif op_type_s == 'osd_repop':
-        assert not (is_read or is_write)
-        return OpType.write_secondary
-    return None
+OpDescription = NamedTuple('OpDescription', [("type", OpType),
+                                             ("client", str),
+                                             ("pool_id", int),
+                                             ("pg", int),
+                                             ("obj_name", str),
+                                             ("op_size", Optional[int])])
 
 
-def get_pool_pg(op: OpRec) -> Tuple[int, int]:
+client_re = r"(?P<client>[^ ]*)"
+pool_pg_re = r"(?P<pool>\d+)\.(?P<pg>[0-9abcdef]+)"
+obj_name_re = r"(?P<obj_name>(?P=pool):[^ ]*)"
+
+osd_op_re = re.compile(
+    (r"osd_op\({client} {pool_pg} {obj_name} \[.*?\b(?P<op>(read|write|writefull)) " +
+     r"(?P<start_offset>\d+)~(?P<end_offset>\d+).*?\] ").format(client=client_re,
+                                                                  pool_pg=pool_pg_re,
+                                                                  obj_name=obj_name_re))
+
+osd_repop_re = re.compile(
+    r"osd_repop\({client} {pool_pg} [^ ]* {obj_name} ".format(client=client_re,
+                                                              pool_pg=pool_pg_re,
+                                                              obj_name=obj_name_re))
+
+
+def get_pool_pg(rr: Match) -> Tuple[int, int]:
     """
     returns pool and pg for op
     """
-    pool_s, pg_s = op['description'].split()[1].split(".")
-    return int(pool_s), int(pg_s, 16)
+    return int(rr.group('pool')), int(rr.group('pg'), 16)
+
+
+class ParseResult(Enum):
+    ok = 0
+    failed = 1
+    ignored = 2
+    unknown = 3
+
+
+ignored_tps = {'delete', 'call', 'watch', 'stat'}
+
+
+def parse_description(descr: str) -> Tuple[ParseResult, Optional[OpDescription]]:
+    """
+    Get type for operation
+    """
+
+    rr = osd_op_re.match(descr)
+    if rr:
+        pool, pg = get_pool_pg(rr)
+        if rr.group('op') == 'read':
+            tp = OpType.read
+        else:
+            assert rr.group('op') in ('write', 'writefull')
+            tp = OpType.write_primary
+        client = rr.group('client')
+        object = rr.group('obj_name')
+        size = int(rr.group('end_offset')) - int(rr.group('start_offset'))
+        return ParseResult.ok, OpDescription(tp, client, pool, pg, object, size)
+
+    rr = osd_repop_re.match(descr)
+    if rr:
+        pool, pg = get_pool_pg(rr)
+        return ParseResult.ok, \
+            OpDescription(OpType.write_secondary, rr.group('client'), pool, pg, rr.group('obj_name'), None)
+
+    raw_tp = descr.split("(", 1)[0]
+    if raw_tp in ("osd_repop_reply", "pg_info"):
+        return ParseResult.ignored, None
+    elif raw_tp == 'osd_op':
+        for info in descr.split("[", 1)[1].split("]", 1)[0].split(","):
+            if info.split()[0] in ignored_tps.intersection():
+                return ParseResult.ignored, None
+
+    return ParseResult.unknown, None
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -392,6 +435,9 @@ class CephOp:
                  raw_data: OpRec,
                  description: str,
                  initiated_at: int,
+                 obj_name: str,
+                 client: str,
+                 op_size: Optional[int],
                  tp: Optional[OpType],
                  duration: int,
                  pool_id: int,
@@ -407,24 +453,41 @@ class CephOp:
         self.pg = pg
         self.events = events
         self.evt_map = dict(events)
+        self.client = client
+        self.op_size = op_size
+        self.obj_name = obj_name
 
     @classmethod
-    def parse_op(cls, op: OpRec) -> 'CephOp':
+    def parse_op(cls, op: OpRec) -> Tuple[ParseResult, Optional['CephOp']]:
+        try:
+            res, descr = parse_description(op['description'])
+        except AssertionError:
+            descr = None
+            res = ParseResult.failed
+
+        if descr is None:
+            return res, None
+
         initiated_at = to_unix_ms(op['initiated_at'])
-        pool, pg = get_pool_pg(op)
-        return cls(
+        return res, cls(
             raw_data=op,
             description=op['description'],
             initiated_at=initiated_at,
-            tp=get_type(op),
+            tp=descr.type,
             duration=int(op['duration'] * 1000),
-            pool_id=pool,
-            pg=pg,
+            pool_id=descr.pool_id,
+            pg=descr.pg,
+            obj_name=descr.obj_name,
+            client=descr.client,
+            op_size=descr.op_size,
             events=parse_events(op, initiated_at))
 
     def get_hl_timings(self) -> HLTimings:
         assert self.tp is not None
         return get_hl_timings(self.tp, self.evt_map)
+
+    def short_descr(self) -> str:
+        return "{0.tp.name} pg={0.pool_id}.{0.pg:x} size={0.op_size} duration={0.duration}".format(self)
 
     def __str__(self) -> str:
         return ("{description}\n    initiated_at: {initiated_at}\n    tp: {tp}\n    duration: {duration}\n    " +
@@ -618,7 +681,7 @@ class CompactPacker(IPacker):
             assert 'local_io' in op
             assert 'wait_for_replica' not in op
             return (("READ              {:>25s}:{:<5x} osd_id={:>4d}" +
-                     "   duration={:>5d}   wait_pg={:>5d}   local_io={:>5d}").
+                     "   duration={:>5d}                 wait_pg={:>5d}   local_io={:>5d}").
                     format(op['pool_name'], op['pg'], op['osd_id'], int(op['duration']), int(op['wait_for_pg']),
                            int(op['local_io'])))
         else:
@@ -969,7 +1032,8 @@ async def dump_cluster_info(commands: List[str], timeout: float = 15) -> Awaitab
 
 
 class CephDumper:
-    def __init__(self, osd_ids: Set[int], size: int, duration: int, cmd_tout: int = 15, min_diration: int = 0) -> None:
+    def __init__(self, osd_ids: Set[int], size: int, duration: int, cmd_tout: int = 15, min_diration: int = 0,
+                 dump_unparsed_headers: bool = False) -> None:
         self.osd_ids = osd_ids
         self.not_inited_osd = osd_ids.copy()
         self.pools_map = {}  # type: Dict[int, Tuple[str, int]]
@@ -980,6 +1044,7 @@ class CephDumper:
         self.min_duration = min_diration
         self.last_time_ops = defaultdict(set)  # type: Dict[int, Set[str]]
         self.first_cycle = True
+        self.dump_unparsed_headers = dump_unparsed_headers
 
     async def reload_pools(self) -> Awaitable[bool]:
         data = json.loads(await subprocess_output("ceph osd lspools -f json", timeout=self.cmd_tout))
@@ -1033,10 +1098,18 @@ class CephDumper:
 
                 ops = []
                 for op in parsed['ops']:
+                    if self.min_duration and int(op.get('duration') * 1000) < self.min_duration:
+                        continue
                     try:
-                        if get_type(op) is not None:
-                            ops.append(CephOp.parse_op(op))
+                        parse_res, ceph_op = CephOp.parse_op(op)
+                        if ceph_op:
+                            ops.append(ceph_op)
+                        elif parse_res == ParseResult.unknown:
+                            logger.debug("UNKNOWN: %s", op['description'])
                     except Exception:
+                        parse_res = ParseResult.failed
+
+                    if parse_res == ParseResult.failed:
                         logger.exception("Failed to parse op: {}".format(pprint.pformat(op)))
 
                 ops = [op for op in ops if op.tp is not None and op.description not in self.last_time_ops[osd_id]]
@@ -1089,7 +1162,8 @@ class DumpLoop:
             func = partial(dump_cluster_info, (PG_DUMP,), self.opts.timeout)
             self.handlers["pg_dump"] = func, self.opts.record_pg_dump, ctime
 
-        dumper = CephDumper(self.osd_ids, self.opts.size, self.opts.duration, self.opts.timeout, self.opts.min_duration)
+        dumper = CephDumper(self.osd_ids, self.opts.size, self.opts.duration,
+                            self.opts.timeout, self.opts.min_duration, self.opts.dump_unparsed_headers)
         self.handlers["historic"] = dumper.dump_historic, self.opts.duration, ctime
 
     def start_handler(self, name: str, repeat: bool = False):
@@ -1149,7 +1223,7 @@ async def record_to_file(loop: asyncio.AbstractEventLoop, opts: Any) -> Awaitabl
 
         with cast(BinaryIO, open_to_append(opts.output_file, True)) as os_fd:
             os_fd.seek(0, os.SEEK_SET)
-            fd = RecordFile(os_fd)
+            fd = RecordFile(os_fd, pack_each=opts.compress_each * 1024)
             header = fd.seek_to_last_valid_record()
 
             if header is None:
@@ -1196,7 +1270,8 @@ def parse(os_fd: BinaryIO) -> Iterator[Tuple[RecId, Any]]:
                 for op in res:
                     op['pool_name'], op['pool'] = pools_map[op['pack_pool_id']]
             elif rec_type == RecId.pools:
-                pools_map = {pack_id: (name, real_id) for real_id, (name, pack_id) in res.items()}
+                # int(...) is a workaround for json issue - it only allows string to be keys
+                pools_map = {pack_id: (name, int(real_id)) for real_id, (name, pack_id) in res.items()}
             yield rec_type, res
         elif rec_type == RecId.params:
             params = json.loads(data.decode("utf8"))
@@ -1250,6 +1325,9 @@ def parse_args(argv: List[str]) -> Any:
                                metavar='SECONDS', default=0)
     record_parser.add_argument("--record-pg-dump", type=int, help="Record cluster pg dump info every SECONDS seconds",
                                metavar='SECONDS', default=0)
+    record_parser.add_argument("--compress-each", type=int, help="Compress each KB kilobytes of record file",
+                               metavar='KiB', default=1024)
+    record_parser.add_argument("--dump-unparsed-headers", action='store_true')
     record_parser.add_argument("output_file", help="Filename to append requests logs to it")
 
     parse_parser = subparsers.add_parser('parse', help="Parse records from file")

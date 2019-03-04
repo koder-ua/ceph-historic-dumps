@@ -6,12 +6,21 @@ set -o errexit
 # CONFIGURABLE
 
 # Tool options
-readonly PACKER=raw
-readonly MIN_DURATION=5
-readonly RECORD_DURATION=10
-readonly RECORD_SIZE=50
+readonly PACKER=compact
+
+readonly MIN_DURATION=10
+readonly RECORD_DURATION=60
+readonly RECORD_SIZE=300
 readonly DEFAULT_TAIL_LINES=20
 readonly PRIMARY_OPTS="--record-cluster 300 --record-pg-dump 1800"
+readonly DUMP_HEADERS=""
+
+readonly TEST_MIN_DURATION=5
+readonly TEST_RECORD_DURATION=10
+readonly TEST_RECORD_SIZE=300
+readonly TEST_PRIMARY_OPTS="--record-cluster 30 --record-pg-dump 60"
+readonly TEST_DUMP_HEADERS="--dump-unparsed-headers"
+
 
 readonly ALL_NODES="ceph01 ceph02 ceph03"
 #readonly ALL_NODES="osd001 osd002 osd003 osd004 osd005 osd006 osd007 osd008 osd009 osd010 osd011 osd012"
@@ -211,6 +220,7 @@ function update_bin {
 function deploy {
     local -r nodes="${1}"
     local -r first_node="${2}"
+    local -r test="${3}"
     local cmd
     local srv_file
     local popt
@@ -219,21 +229,40 @@ function deploy {
         do_scp "${BIN}" "${node}:${TARGET}"
 
         if [[ "${node}" == "${first_node}" ]] ; then
-            popt="${PRIMARY_OPTS}"
+            if [[ "${test}" == "1" ]] ; then
+                popt="${TEST_PRIMARY_OPTS}"
+            else
+                popt="${PRIMARY_OPTS}"
+            fi
         else
             popt=""
         fi
 
-        srv_file=$(sed --expression "s/{DURATION}/${RECORD_DURATION}/" \
-                       --expression "s/{SIZE}/${RECORD_SIZE}/" \
-                       --expression "s/{PACKER}/${PACKER}/" \
-                       --expression "s/{MIN_DURATION}/${MIN_DURATION}/" \
-                       --expression "s/{PRIMARY}/${popt}/" \
-                       --expression "s/{PYTHON}/${PYTHON//\//\\/}/" \
-                       --expression "s/{PY_FILE}/${TARGET//\//\\/}/" \
-                       --expression "s/{LOG_FILE}/${LOG//\//\\/}/" \
-                       --expression "s/{USER}/${TARGET_USER}/" \
-                       --expression "s/{RESULT}/${RESULT//\//\\/}/" < "${SRV_FILE}")
+        if [[ "${test}" == "1" ]] ; then
+            srv_file=$(sed --expression "s/{DURATION}/${TEST_RECORD_DURATION}/" \
+                           --expression "s/{SIZE}/${TEST_RECORD_SIZE}/" \
+                           --expression "s/{PACKER}/${PACKER}/" \
+                           --expression "s/{DUMP_UNKNOWN_HEADERS}/${DUMP_HEADERS}/" \
+                           --expression "s/{MIN_DURATION}/${TEST_MIN_DURATION}/" \
+                           --expression "s/{PRIMARY}/${popt}/" \
+                           --expression "s/{PYTHON}/${PYTHON//\//\\/}/" \
+                           --expression "s/{PY_FILE}/${TARGET//\//\\/}/" \
+                           --expression "s/{LOG_FILE}/${LOG//\//\\/}/" \
+                           --expression "s/{USER}/${TARGET_USER}/" \
+                           --expression "s/{RESULT}/${RESULT//\//\\/}/" < "${SRV_FILE}")
+        else
+            srv_file=$(sed --expression "s/{DURATION}/${RECORD_DURATION}/" \
+                           --expression "s/{SIZE}/${RECORD_SIZE}/" \
+                           --expression "s/{PACKER}/${PACKER}/" \
+                           --expression "s/{DUMP_UNKNOWN_HEADERS}/${DUMP_HEADERS}/" \
+                           --expression "s/{MIN_DURATION}/${MIN_DURATION}/" \
+                           --expression "s/{PRIMARY}/${popt}/" \
+                           --expression "s/{PYTHON}/${PYTHON//\//\\/}/" \
+                           --expression "s/{PY_FILE}/${TARGET//\//\\/}/" \
+                           --expression "s/{LOG_FILE}/${LOG//\//\\/}/" \
+                           --expression "s/{USER}/${TARGET_USER}/" \
+                           --expression "s/{RESULT}/${RESULT//\//\\/}/" < "${SRV_FILE}")
+        fi
 
         echo "${srv_file}" | ${SSH_CMD} "${node}" "cat > /tmp/${SRV_FILE}"
 
@@ -249,13 +278,14 @@ function deploy {
 }
 
 
-function get_record_file_size {
+function get_file_size {
     local -r node="${1}"
+    local -r file="${2}"
 
-    log_file_ll=$(do_ssh_out "${node}" "ls -l '${RESULT}' 2>&1 || true")
+    local -r file_ll=$(do_ssh_out "${node}" "ls -l '${file}' 2>&1 || true")
 
-    if [[ "${log_file_ll}" != *"No such file or directory"* ]] ; then
-        echo "${log_file_ll}" | awk '{print $5}'
+    if [[ "${file_ll}" != *"No such file or directory"* ]] ; then
+        echo "${file_ll}" | awk '{print $5}'
     fi
 }
 
@@ -272,24 +302,33 @@ function show {
         srv_stat=$(do_ssh_out "${node}" "systemctl status ${SERVICE} | grep Active || true")
 
 
-        log_file_ll=$(get_record_file_size "${node}")
-
-        if [[ "${log_file_ll}" == "" ]] ; then
-            log_size="NO FILE"
+        record_file_size=$(get_file_size "${node}" "${RESULT}")
+        if [[ "${record_file_size}" == "" ]] ; then
+            record_file_size="NO FILE"
         else
-            log_size=$(numfmt --to=iec-i --suffix=B "${log_file_ll}")
+            record_file_size=$(numfmt --to=iec-i --suffix=B "${record_file_size}")
+        fi
+
+        log_file_size=$(get_file_size "${node}" "${LOG}")
+        if [[ "${log_file_size}" == "" ]] ; then
+            log_file_size="NO FILE"
+        else
+            log_file_size=$(numfmt --to=iec-i --suffix=B "${log_file_size}")
         fi
 
         pid=$(do_ssh_out "${node}" "systemctl --property=MainPID show ${SERVICE}")
 
         if [[ "${srv_stat}" == *" inactive "* ]] ; then
-            printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${RED}" "${srv_stat}" "${NO_COLOR}" "${log_size}"
+            printf "%-20s : %b %s %b data_sz = %10s  log_sz = %10s\n" \
+                "${node}" "${RED}" "${srv_stat}" "${NO_COLOR}" "${record_file_size}" "${log_file_size}"
         else
             if [[ "${srv_stat}" == *" failed "* ]] ; then
-                printf "%-20s : %b %s %b data_sz = %s\n" "${node}" "${RED}" "${srv_stat}" "${NO_COLOR}" "${log_size}"
+                printf "%-20s : %b %s %b data_sz = %10s  log_sz = %10s\n" \
+                    "${node}" "${RED}" "${srv_stat}" "${NO_COLOR}" "${record_file_size}" "${log_file_size}"
             else
-                printf "%-20s : %b %s %b pid = %s  data_sz = %s\n" \
-                       "${node}" "${GREEN}" "${srv_stat}" "${NO_COLOR}" "${pid:8}" "${log_size}"
+                printf "%-20s : %b %s %b pid = %10s  data_sz = %10s  log_sz = %10s\n" \
+                       "${node}" "${GREEN}" "${srv_stat}" "${NO_COLOR}" "${pid:8}" \
+                       "${record_file_size}" "${log_file_size}"
             fi
         fi
     done
@@ -348,8 +387,9 @@ function collect {
 function redeploy {
     local -r nodes="${1}"
     local -r first_node="${2}"
+    local -r test="${3}"
     clean "${nodes}"
-    deploy "${nodes}" "${first_node}"
+    deploy "${nodes}" "${first_node}" "${test}"
     start "${nodes}"
 }
 
@@ -360,6 +400,7 @@ function main {
     local parallel="0"
     local parallel_prefix=""
     local no_dump_info="0"
+    local test="0"
 
     local -r command="${1}"
     shift
@@ -383,6 +424,9 @@ function main {
             ;;
         --no-dump-info)
             no_dump_info="1"
+            ;;
+        --test)
+            test="1"
             ;;
         esac
         shift
@@ -424,11 +468,11 @@ function main {
         ${parallel_prefix} collect "${ALL_NODES}" "${tgt}"
         ;;
     -r|--redeploy)
-        ${parallel_prefix} redeploy "${ALL_NODES}" "${first_node}"
+        ${parallel_prefix} redeploy "${ALL_NODES}" "${first_node}" "${test}"
         ${parallel_prefix} show "${ALL_NODES}" | sort
         ;;
     -d|--deploy)
-        ${parallel_prefix} deploy "${ALL_NODES}" "${first_node}"
+        ${parallel_prefix} deploy "${ALL_NODES}" "${first_node}" "${test}"
         ;;
     -s|--show)
         if [[ "${parallel}" == "1" ]] ; then

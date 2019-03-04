@@ -1,4 +1,7 @@
+import os
 import sys
+import time
+
 import math
 import logging
 import argparse
@@ -128,7 +131,9 @@ def seconds_to_str(seconds: Union[int, float]) -> str:
 
     if d == 0:
         if h == 0:
-            if s == 0:
+            if m == 0:
+                if s == 0:
+                    return 0
                 return f"{s:02d}"
             return f"{m:02d}:{s:02d}"
         return f"{h}:{m:02d}:{s:02d}"
@@ -185,18 +190,21 @@ class LogInfo(NamedTuple):
     pool_info_times: List[int]
 
     def store(self, storage: StorageType):
-        storage['data'] = self.data
+        storage['data'] = self.data.drop(['host', 'pool_name'], axis=1)
         self.info.store(storage)
         storage['pg_dump'] = self.pg_dump
         storage['pg_dump_time'] = pandas.Series(self.pg_dump_times)
-        storage['pool_info'] = pandas.Series(self.pool_info)
+        storage['pool_info'] = self.pool_info
         storage['pool_info_times'] = pandas.Series(self.pool_info_times)
 
     @classmethod
     def load(cls, storage: StorageType) -> 'LogInfo':
-        data = storage['data']
         info = ClusterInfo.load(storage)
-        data['node'] = [info.osd2node.get(osd_id) for osd_id in data['osd_id']]
+        data = storage['data']
+        pool_names = [info.pool_id2name.get(pool_id) for pool_id in data['pool_id']]
+        data['pool_name'] = pandas.Series(pool_names).astype('category')
+        data['host'] = pandas.Series([info.osd2node.get(osd_id) for osd_id in data['osd_id']]).astype('category')
+
         return cls(data=data, info=info,
                    pg_dump=storage['pg_dump'],
                    pg_dump_times=list(storage['pg_dump_time']),
@@ -218,9 +226,6 @@ def iterate_op_records(fnames: List[str]) -> Iterator[Tuple[ceph_ho_dumper.RecId
                 if rec_id == ceph_ho_dumper.RecId.params:
                     if 'hostname' not in op:
                         op['hostname'] = fname.split('-', 1)[0]
-                if rec_id == ceph_ho_dumper.RecId.params:
-                    if 'hostname' not in op:
-                        op['hostname'] = fname.split('-', 1)[0]
                 yield rec_id, op
 
 
@@ -235,9 +240,9 @@ def extract_from_pgdump(data: Dict[str, Any]) -> Tuple[int, Dict[str, List[int]]
     res: Dict[str, List[int]] = collections.defaultdict(list)
 
     for pg_info in data["pg_stats"]:
-        pool, pgid = pg_info['"pgid"'].split('.')
+        pool, pgid = pg_info['pgid'].split('.')
         res['pgid'].append(int(pgid, 16))
-        res['pool'].append(int(pool))
+        res['pool_id'].append(int(pool))
 
         for name, val in pg_info["stat_sum"].items():
             res[name].append(val)
@@ -260,8 +265,10 @@ def parse_logs_to_pd(ops_iterator: Iterable[Tuple[ceph_ho_dumper.RecId, Any]]) -
     osd_ids: List[int] = []
     durations: List[int] = []
     op_types: List[int] = []
-    pools: List[int] = []
+    pool_ids: List[int] = []
     pgs: List[int] = []
+    pool_name: List[str] = []
+    hosts: List[str] = []
 
     local_io: List[int] = []
     wait_for_pg: List[int] = []
@@ -300,8 +307,8 @@ def parse_logs_to_pd(ops_iterator: Iterable[Tuple[ceph_ho_dumper.RecId, Any]]) -
                     download_tm, wait_for_pg_tm, local_io_tm, wait_for_replica_tm = \
                         ceph_ho_dumper.get_hl_timings(tp, op)
                 else:
-                    download_tm = op.get('download', -1)
-                    wait_for_replica_tm = op.get('wait_for_replica', -1)
+                    download_tm = op.get('download', 0)
+                    wait_for_replica_tm = op.get('wait_for_replica', 0)
                     local_io_tm = op['local_io']
                     wait_for_pg_tm = op['wait_for_pg']
 
@@ -312,7 +319,7 @@ def parse_logs_to_pd(ops_iterator: Iterable[Tuple[ceph_ho_dumper.RecId, Any]]) -
 
                 assert hostname is not None
                 osd2hostname[op['osd_id']] = hostname
-                pools.append(op['pool'])
+                pool_ids.append(op['pool'])
                 pgs.append(op['pg'])
                 osd_ids.append(op['osd_id'])
                 durations.append(op['duration'])
@@ -322,9 +329,12 @@ def parse_logs_to_pd(ops_iterator: Iterable[Tuple[ceph_ho_dumper.RecId, Any]]) -
                 download.append(download_tm)
                 wait_for_replica.append(wait_for_replica_tm)
                 rec_time.append(op['time'])
+                pool_name.append(op['pool_name'])
+                hosts.append(hostname)
+
         elif op_tp == ceph_ho_dumper.RecId.params:
             hostname = params['hostname']
-        elif op_tp == ceph_ho_dumper.RecId.params:
+        elif op_tp == ceph_ho_dumper.RecId.cluster_info:
             if ceph_ho_dumper.PG_DUMP in params:
                 ctime, new_pg_data = extract_from_pgdump(params[ceph_ho_dumper.PG_DUMP])
                 for name, vals in new_pg_data.items():
@@ -355,9 +365,11 @@ def parse_logs_to_pd(ops_iterator: Iterable[Tuple[ceph_ho_dumper.RecId, Any]]) -
         'osd_id': numpy.array(osd_ids, dtype=numpy.uint16),
         'duration': numpy.array(durations, dtype=numpy.uint32),
         'op_type': numpy.array(op_types, dtype=numpy.uint8),
-        'pool': numpy.array(pools, dtype=numpy.uint8),
+        'pool_id': numpy.array(pool_ids, dtype=numpy.uint8),
         'pg': numpy.array(pgs, dtype=numpy.uint32),
-        'time': numpy.array(rec_time, dtype=numpy.uint32)
+        'time': numpy.array(rec_time, dtype=numpy.uint32),
+        'pool_name': pandas.Series(pool_name).astype('category'),
+        'host': pandas.Series(hosts).astype('category'),
     })
 
     return LogInfo(data, cluster_info,
@@ -536,11 +548,9 @@ def top_slow_nodes(df: pandas.DataFrame, count: int = 10, time_limit: int = 100)
 
 
 def slowness_cumulative(df: pandas.DataFrame) -> Table:
-    df_f = df[(df['download'] != -1) | (df['wait_for_pg'] != -1) | (df['local_io'] != -1)]
-
-    net_slowest = (df_f['download'] > df_f['wait_for_pg']) & (df_f['download'] > df_f['local_io'])
-    pg_slowest = (df_f['wait_for_pg'] > df_f['download']) & (df_f['wait_for_pg'] > df_f['local_io'])
-    disk_slowest = (df_f['local_io'] > df_f['wait_for_pg']) & (df_f['local_io'] > df_f['download'])
+    net_slowest = (df['download'] > df['wait_for_pg']) & (df['download'] > df['local_io'])
+    pg_slowest = (df['wait_for_pg'] > df['download']) & (df['wait_for_pg'] > df['local_io'])
+    disk_slowest = (df['local_io'] > df['wait_for_pg']) & (df['local_io'] > df['download'])
 
     MS2S = 1000
     duration = df['duration']
@@ -600,6 +610,32 @@ def slowness_by_duration(df: pandas.DataFrame) -> Table:
     return res
 
 
+def pool_pg_wait(df: pandas.DataFrame, pool_df: pandas.DataFrame) -> Table:
+    bypool = df[['pool_name', 'duration', 'wait_for_pg']].groupby(['pool_name'])
+    count = bypool.count()
+    count_dct = dict(zip(count.index, count['duration'].values))
+    total = bypool['duration'].agg('sum').to_dict()
+    wait_pg = bypool['wait_for_pg'].agg('sum').to_dict()
+    wait_pg_perc = {name: int(100 * wait / max(1, total[name])) for name, wait in wait_pg.items()}
+
+    t = Table("Slowness by pool", ["Name", "Total ops", "Total slow", "Slow %", "Total slow time",
+                                   "Total pg wait", "pg wait avg", "pg wait %"])
+    for pool_name, wait_perc in sorted(wait_pg_perc.items(), key=lambda x: -x[1]):
+        write_ops_arr = pool_df[pool_df['name'] == pool_name]['write_ops']
+        read_ops_arr = pool_df[pool_df['name'] == pool_name]['read_ops']
+        write_ops = write_ops_arr.values[-1] - write_ops_arr.values[0]
+        read_ops = read_ops_arr.values[-1] - read_ops_arr.values[0]
+        t.add_line(pool_name,
+                   write_ops + read_ops,
+                   count_dct[pool_name],
+                   100 * count_dct[pool_name] // max(1, write_ops + read_ops),
+                   seconds_to_str(total[pool_name]),
+                   seconds_to_str(int(wait_pg[pool_name])),
+                   int(wait_pg[pool_name] / max(1, count_dct[pool_name])),
+                   wait_perc)
+
+    return t
+
 # ----------------------------------------------------------------------------------------------------------------------
 
 
@@ -610,6 +646,9 @@ def parse_args(argv: List[str]) -> Any:
 
     subparsers = parser.add_subparsers(dest='subparser_name')
 
+    dbinfo_parsr = subparsers.add_parser('dbinfo', help="Show database info")
+    dbinfo_parsr.add_argument("hdf5_file", help="HDF5 file to read data from")
+
     tohdf5_parser = subparsers.add_parser('tohdfs', help="Convert binary files to hds")
     tohdf5_parser.add_argument("target", help="HDF5 file path to store to")
     tohdf5_parser.add_argument("sources", nargs="+", help="record files to import")
@@ -617,16 +656,20 @@ def parse_args(argv: List[str]) -> Any:
     report_parser = subparsers.add_parser('report', help="Make a report on data from hdf5 file")
     report_parser.add_argument("--count", default=10, type=int, help="Slowest object(PG/OSD/node) count")
     report_parser.add_argument("--slow-osd", action="store_true", help="Slow osd report")
-    report_parser.add_argument("--source-by-duration", action="store_true", help="Show source by duration report")
     report_parser.add_argument("--slow-node", action="store_true", help="Slow osd report")
     report_parser.add_argument("--slowness-source", action="store_true", help="Slow source for slow requests")
     report_parser.add_argument("--duration-distribution", action="store_true", help="Show all reports")
+    report_parser.add_argument("--per-pool", action="store_true")
 
     plot_parser = subparsers.add_parser('plot', help="Make a report on data from hdf5 file")
     plot_parser.add_argument("--slowness-source", action="store_true", help="Slow source for slow requests")
     plot_parser.add_argument("--duration-distribution", action="store_true", help="Show all reports")
 
     for rparser in (plot_parser, report_parser):
+        rparser.add_argument("--op", nargs='+', choices=['read', 'write_primary', 'write_secondary', 'write'],
+                             default=['read', 'write'],
+                             help="Select op type")
+        rparser.add_argument("--min-time", type=int, default=0, help="Select min op time to considered slow")
         rparser.add_argument("--all", action="store_true", help="Slow source for slow requests")
         rparser.add_argument("hdf5_file", help="HDF5 file to read data from")
 
@@ -641,16 +684,47 @@ def main(argv: List[str]) -> int:
         convert_to_hdfs(opts.target, opts.sources)
         return 0
 
+    if opts.subparser_name == 'dbinfo':
+        info = load_hdf(opts.hdf5_file)
+        df = info.data
+        print("On-disk size ", os.stat(opts.hdf5_file).st_size // 1024 // 1024, "MiB")
+        print(df.info(memory_usage='deep'))
+
+        for dtype in ['uint32', 'uint16', 'uint8', 'category']:
+            selected_dtype = df.select_dtypes(include=[dtype])
+            mean_usage_b = selected_dtype.memory_usage(deep=True).mean()
+            mean_usage_mb = mean_usage_b / 1024 ** 2
+            print(f"Average memory usage for {dtype} columns: {mean_usage_mb:03.2f} MiB")
+
+        return 0
+
     if opts.subparser_name == 'report' or opts.subparser_name == 'plot':
 
         info = load_hdf(opts.hdf5_file)
         df = info.data
+        if opts.min_time != 0:
+            df = df[df['duration'] > opts.min_time]
 
-        primary_writes = df[df['op_type'] == ceph_ho_dumper.OpType.write_primary.value]
-        secondary_writes = df[df['op_type'] == ceph_ho_dumper.OpType.write_secondary.value]
-        writes = df[(df['op_type'] == ceph_ho_dumper.OpType.write_secondary.value) |
-                    (df['op_type'] == ceph_ho_dumper.OpType.write_secondary.value)]
-        reads = df[df['op_type'] == ceph_ho_dumper.OpType.read.value]
+        all_ops = set()
+        for op in set(opts.op):
+            if op == 'write':
+                all_ops.add('write_primary')
+                all_ops.add('write_secondary')
+            else:
+                all_ops.add(op)
+
+        if all_ops != {'read', 'write_primary', 'write_secondary'}:
+            selectors = [df['op_type'] == getattr(ceph_ho_dumper.OpType, name).value for name in all_ops]
+            selector = selectors[0]
+            for more_sel in selectors[1:]:
+                selector |= more_sel
+            df = df[selector]
+
+        # primary_writes = df[df['op_type'] == ceph_ho_dumper.OpType.write_primary.value]
+        # secondary_writes = df[df['op_type'] == ceph_ho_dumper.OpType.write_secondary.value]
+        # writes = df[(df['op_type'] == ceph_ho_dumper.OpType.write_secondary.value) |
+        #             (df['op_type'] == ceph_ho_dumper.OpType.write_secondary.value)]
+        # reads = df[df['op_type'] == ceph_ho_dumper.OpType.read.value]
 
         if opts.subparser_name == 'plot':
             if opts.all or opts.slowness_source:
@@ -666,7 +740,11 @@ def main(argv: List[str]) -> int:
             if opts.all or opts.slowness_source:
                 print(table2txt(slowness_by_duration(df)))
                 print()
-                print(table2txt(slowness_cumulative(writes)))
+                print(table2txt(slowness_cumulative(df)))
+                print()
+
+            if opts.all or opts.per_pool:
+                print(table2txt(pool_pg_wait(df, info.pool_info)))
                 print()
 
             if opts.all or opts.slow_osd:
