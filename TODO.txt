@@ -1,2 +1,5 @@
 * store client ID for op
 * record osd performance metrics
+* add status socket
+* show log file size on -s
+* add reload option to drop record file

@@ -22,14 +22,13 @@ readonly ALL_NODES="ceph01 ceph02 ceph03"
 
 # ALMOST CONSTANT
 readonly PYTHON="/usr/bin/python3.5"
-readonly BIN=ceph_ho_dumper_async.py
+readonly BIN=ceph_ho_dumper.py
 readonly TARGET="/tmp/${BIN}"
 readonly SHELL="/bin/bash"
 readonly LOG=/tmp/ceph_ho_dumper.log
 readonly RESULT=/tmp/historic_ops_dump.bin
 readonly SRV_FILE=mira-ceph-ho-dumper.service
 readonly FORCE_DUMP_SIGNAL=SIGUSR1
-readonly MAX_LOG_UPDATE_WAIT_TIME=60
 
 
 # CONSTANTS

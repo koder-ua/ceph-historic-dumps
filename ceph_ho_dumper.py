@@ -1,34 +1,34 @@
 #!/usr/bin/env python3.5
-import abc
-import bisect
-import logging
 import os
-import pprint
 import re
 import sys
 import bz2
+import abc
+from io import BytesIO
 
 import math
 import stat
 import json
 import time
 import zlib
-import heapq
+import bisect
 import socket
 import signal
+import pprint
+import asyncio
 import os.path
+import logging
 import argparse
 import datetime
 import subprocess
 from enum import Enum
 from struct import Struct
-import concurrent.futures
 from functools import partial
 from collections import defaultdict
 
 from typing.io import BinaryIO, TextIO
 from typing import List, Dict, Tuple, Iterator, Any, Optional, Union, Callable, Set, Type, cast, NewType, NamedTuple, \
-    Iterable
+    Iterable, Awaitable
 
 logger = logging.getLogger('ops dumper')
 
@@ -78,6 +78,7 @@ class RecId(Enum):
     pools = 2
     cluster_info = 3
     params = 4
+    packed = 5
 
 
 HEADER_V11 = b"OSD OPS LOG v1.1\0"
@@ -166,68 +167,130 @@ def open_to_append(fname: str, is_bin: bool = False) -> Union[BinaryIO, TextIO]:
 # ----------------------  file records operating functions -------------------------------------------------------------
 
 
-rec_header = Struct("!II")
+class RecordFile:
+    rec_header = Struct("!II")
 
+    def __init__(self, fd: BinaryIO, pack_each: int = 2 ** 20,
+                 packer: Tuple[Callable[[bytes], bytes], Callable[[bytes], bytes]] = (compress, decompress)) -> None:
+        if pack_each != 0:
+            assert fd.seekable()
 
-def write_record(fd: BinaryIO, rec_type: RecId, data: bytes, flush: bool = True) -> None:
-    """
-    Write variable-size record to file along with checksum
-    """
-    id_bt = bytes((rec_type.value,))
-    checksum = zlib.adler32(data, zlib.adler32(id_bt))
-    fd.write(rec_header.pack(checksum, len(data) + 1) + id_bt)
-    fd.write(data)
-    if flush:
-        fd.flush()
+        self.fd = fd
+        self.pack_each = pack_each
+        self.compress, self.decompress = packer
+        self.cached = []
+        self.cache_size = 0
+        self.unpacked_offset = 0
 
+    def tell(self) -> int:
+        return self.fd.tell()
 
-def iter_records(fd: BinaryIO) -> Iterator[Tuple[RecId, bytes]]:
-    """
-    iterate over records in output file, written with write_record function
-    """
+    def read_file_header(self) -> Optional[bytes]:
+        """
+        read header from file, return fd positioned to first byte after the header
+        check that header is in supported headers, fail otherwise
+        must be called from offset 0
+        """
+        assert self.fd.seekable()
+        assert self.fd.tell() == 0, "read_file_header must be called from beginning of the file"
+        self.fd.seek(0, os.SEEK_END)
+        size = self.fd.tell()
+        if size == 0:
+            return None
 
-    rec_size = rec_header.size
-    unpack = rec_header.unpack
+        assert self.fd.readable()
+        self.fd.seek(0, os.SEEK_SET)
+        assert size >= HEADER_LEN, "Incorrect header"
+        hdr = self.fd.read(HEADER_LEN)
+        assert hdr in ALL_SUPPORTED_HEADERS, "Unknown header {!r}".format(hdr)
+        return hdr
 
-    offset = fd.tell()
-    fd.seek(0, os.SEEK_END)
-    size = fd.tell()
-    fd.seek(offset, os.SEEK_SET)
+    def make_header_for_rec(self, rec_type: RecId, data: bytes):
+        id_bt = bytes((rec_type.value,))
+        checksum = zlib.adler32(data, zlib.adler32(id_bt))
+        return self.rec_header.pack(checksum, len(data) + 1) + id_bt
 
-    try:
-        while offset < size:
-            data = fd.read(rec_size)
-            if len(data) != rec_size:
-                raise UnexpectedEOF()
-            checksum, data_size = unpack(data)
-            data = fd.read(data_size)
-            if len(data) != data_size:
-                raise UnexpectedEOF()
-            assert checksum == zlib.adler32(data), "record corrupted at offset {}".format(offset)
-            yield RecId(data[0]), data[1:]
-            offset += rec_size + data_size
-    except Exception:
-        fd.seek(offset, os.SEEK_SET)
-        raise
+    def write_record(self, rec_type: RecId, data: bytes, flush: bool = True) -> None:
+        header = self.make_header_for_rec(rec_type, data)
+        truncate = False
 
+        if self.pack_each != 0:
+            if self.cache_size == 0:
+                self.unpacked_offset = self.fd.tell()
 
-def read_header(fd: BinaryIO) -> Optional[bytes]:
-    """
-    read header from file, return fd positioned to first byte after the header
-    check that header is in supported headers, fail otherwise
-    must be called from offset 0
-    """
-    assert fd.tell() == 0, "read_header must be called from beginning of the file"
-    fd.seek(0, os.SEEK_END)
-    size = fd.tell()
-    if size == 0:
-        return None
+            self.cached.extend([header, data])
+            self.cache_size += len(header) + len(data)
 
-    fd.seek(0, os.SEEK_SET)
-    assert size >= HEADER_LEN, "Incorrect header"
-    hdr = fd.read(HEADER_LEN)
-    assert hdr in ALL_SUPPORTED_HEADERS, "Unknown header {!r}".format(hdr)
-    return hdr
+            if self.cache_size >= self.pack_each:
+                data = self.compress(b"".join(self.cached))
+                header = self.make_header_for_rec(RecId.packed, data)
+                logger.debug("Repack data orig size=%sKiB new_size=%sKiB",
+                             self.cache_size // 1024, (len(header) + len(data)) // 1024)
+                self.cached = []
+                self.cache_size = 0
+                self.fd.seek(self.unpacked_offset)
+                truncate = True
+                self.unpacked_offset = self.fd.tell()
+
+        self.fd.write(header)
+        self.fd.write(data)
+        if truncate:
+            self.fd.truncate()
+
+        if flush:
+            self.fd.flush()
+
+    def iter_records(self) -> Iterator[Tuple[RecId, bytes]]:
+        """
+        iterate over records in output file, written with write_record function
+        """
+
+        rec_size = self.rec_header.size
+        unpack = self.rec_header.unpack
+
+        offset = self.fd.tell()
+        self.fd.seek(0, os.SEEK_END)
+        size = self.fd.tell()
+        self.fd.seek(offset, os.SEEK_SET)
+
+        try:
+            while offset < size:
+                data = self.fd.read(rec_size)
+                if len(data) != rec_size:
+                    raise UnexpectedEOF()
+                checksum, data_size = unpack(data)
+                data = self.fd.read(data_size)
+                if len(data) != data_size:
+                    raise UnexpectedEOF()
+                assert checksum == zlib.adler32(data), "record corrupted at offset {}".format(offset)
+
+                rec_id = RecId(data[0])
+                data = data[1:]
+
+                if rec_id == RecId.packed:
+                    yield from RecordFile(BytesIO(self.decompress(data))).iter_records()  # type: ignore
+                else:
+                    yield rec_id, data
+
+                offset += rec_size + data_size
+        except Exception:
+            self.fd.seek(offset, os.SEEK_SET)
+            raise
+
+    def seek_to_last_valid_record(self) -> Optional[bytes]:
+        header = self.read_file_header()
+
+        if header is None:
+            return None
+
+        try:
+            for _ in self.iter_records():
+                pass
+        except (UnexpectedEOF, AssertionError, ValueError):
+            logger.warning("File corrupted after offset %d. Truncate to last valid offset", self.fd.tell())
+            self.fd.truncate()
+
+        return header
 
 
 # -------------------------   historic ops helpers ---------------------------------------------------------------------
@@ -757,7 +820,49 @@ def get_packer(name: str) -> Type[IPacker]:
 # --------- CEPH UTILS -------------------------------------------------------------------------------------------------
 
 
-def get_local_osds(target_class: str = None, timeout: int = 15) -> Set[int]:
+async def subprocess_output(cmd: str, shell: bool = False, timeout: float = 15) -> Awaitable[str]:
+    if shell:
+        proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE,
+                                                     stderr=asyncio.subprocess.STDOUT)
+    else:
+        proc = await asyncio.create_subprocess_exec(*cmd.split(), stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.STDOUT)
+
+    fut = proc.communicate()
+    try:
+        data, stderr = await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.error("Cmd: %r hang for %s seconds. Terminating it", cmd, timeout)
+        proc.terminate()
+        try:
+            data, stderr = await asyncio.wait_for(fut, timeout=1)
+        except asyncio.TimeoutError:
+            logger.error("Cmd: %r hang for %s seconds. Killing it", cmd, timeout + 1)
+            proc.kill()
+            raise subprocess.CalledProcessError(-9, cmd)
+
+    assert proc.returncode is not None
+    assert stderr is None
+
+    data_s = data.decode("utf8")
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=data_s)
+
+    return data_s
+
+
+def get_all_child_osds(node: Dict, crush_nodes: Dict[int, Dict], target_class: str = None) -> Iterator[int]:
+    # workaround for incorrect node classes on some prod clusters
+    if node['type'] == 'osd' or re.match("osd\.\d+", node['name']):
+        if target_class is None or node.get('device_class') == target_class:
+            yield node['id']
+        return
+
+    for ch_id in node['children']:
+        yield from get_all_child_osds(crush_nodes[ch_id], crush_nodes)
+
+
+async def get_local_osds(target_class: str = None, timeout: int = 15) -> Awaitable[Set[int]]:
     """
     Get OSD id's for current node from ceph osd tree for selected osd class (all classes by default)
     Search by hostname, as returned from socket.gethostname
@@ -768,7 +873,7 @@ def get_local_osds(target_class: str = None, timeout: int = 15) -> Set[int]:
     hostnames = {socket.gethostname(), socket.getfqdn()}
 
     try:
-        osd_nodes_s = subprocess.check_output("ceph node ls osd -f json".split(), timeout=timeout).decode("utf8")
+        osd_nodes_s = await subprocess_output("ceph node ls osd -f json", timeout=timeout)
     except subprocess.SubprocessError:
         osd_nodes_s = None
 
@@ -778,25 +883,18 @@ def get_local_osds(target_class: str = None, timeout: int = 15) -> Set[int]:
         for name in hostnames:
             if name in osd_nodes:
                 all_osds_by_node_name = osd_nodes[name]
-    else:
-        def get_all_child_osds(node: Dict, crush_nodes: Dict[int, Dict]) -> Iterator[int]:
-            # workaround for incorrect node classes on some prod clusters
-            if node['type'] == 'osd' or re.match("osd\.\d+", node['name']):
-                if target_class is None or node.get('device_class') == target_class:
-                    yield node['id']
-                return
 
-            for ch_id in node['children']:
-                yield from get_all_child_osds(crush_nodes[ch_id], crush_nodes)
+    if all_osds_by_node_name is not None:
+        return all_osds_by_node_name
 
-        tree_js = subprocess.check_output("ceph osd tree -f json".split(), timeout=timeout).decode("utf8")
-        nodes = {node['id']: node for node in json.loads(tree_js)['nodes']}
+    tree_js = await subprocess_output("ceph osd tree -f json", timeout=timeout)
+    nodes = {node['id']: node for node in json.loads(tree_js)['nodes']}
 
-        for node in nodes.values():
-            if node['type'] == 'host' and node['name'] in hostnames:
-                assert all_osds_by_node_name is None, \
-                    "Current node with names {} found two times in osd tree".format(hostnames)
-                all_osds_by_node_name = set(get_all_child_osds(node, nodes))
+    for node in nodes.values():
+        if node['type'] == 'host' and node['name'] in hostnames:
+            assert all_osds_by_node_name is None, \
+                "Current node with names {} found two times in osd tree".format(hostnames)
+            all_osds_by_node_name = set(get_all_child_osds(node, nodes, target_class))
 
     if all_osds_by_node_name is not None:
         return all_osds_by_node_name
@@ -804,8 +902,8 @@ def get_local_osds(target_class: str = None, timeout: int = 15) -> Set[int]:
     all_osds_by_node_ip = set()
 
     # find by node ips
-    all_ips = subprocess.check_output("hostname -I".split(), timeout=timeout).decode("utf8").split()
-    osds_js = subprocess.check_output("ceph osd dump -f json".split(), timeout=timeout).decode("utf8")
+    all_ips = (await subprocess_output("hostname -I", timeout=timeout)).split()
+    osds_js = await subprocess_output("ceph osd dump -f json", timeout=timeout)
     for osd in json.loads(osds_js)['osds']:
         public_ip = osd['public_addr'].split(":", 1)[0]
         cluster_ip = osd['cluster_addr'].split(":", 1)[0]
@@ -816,7 +914,10 @@ def get_local_osds(target_class: str = None, timeout: int = 15) -> Set[int]:
     return all_osds_by_node_ip
 
 
-def set_size_duration(osd_ids: Set[int], size: int, duration: int, timeout: int = 15) -> Set[int]:
+async def set_size_duration(osd_ids: Set[int],
+                            size: int,
+                            duration: int,
+                            timeout: int = 15):
     """
     Set size and duration for historic_ops log
     """
@@ -825,21 +926,18 @@ def set_size_duration(osd_ids: Set[int], size: int, duration: int, timeout: int 
         try:
             for set_part in ["osd_op_history_duration {}".format(duration), "osd_op_history_size {}".format(size)]:
                 cmd = "ceph daemon osd.{} config set {}"
-                out = subprocess.check_output(cmd.format(osd_id, set_part).split(),
-                                              stderr=subprocess.STDOUT,
-                                              timeout=timeout).decode("utf8")
+                out = await subprocess_output(cmd.format(osd_id, set_part), timeout=timeout)
                 assert "success" in out
         except subprocess.SubprocessError:
             not_inited_osd.add(osd_id)
     return not_inited_osd
 
 
-def get_historic(osd_id: int, timeout: int = 15) -> str:
+async def get_historic(osd_id: int, timeout: int = 15):
     """
     Get historic ops from osd
     """
-    cmd = "ceph daemon osd.{} dump_historic_ops".format(osd_id).split()
-    return subprocess.check_output(cmd, timeout=timeout).decode("utf8")
+    return await subprocess_output("ceph daemon osd.{} dump_historic_ops".format(osd_id), timeout=timeout)
 
 
 # TODO: start them also for SIGUSR1
@@ -854,14 +952,14 @@ FileRec = Tuple[RecId, Any]
 BinaryFileRec = Tuple[RecId, bytes]
 
 
-def dump_cluster_info(commands: List[str], timeout: float = 15) -> List[FileRec]:
+async def dump_cluster_info(commands: List[str], timeout: float = 15) -> Awaitable[List[FileRec]]:
     """
     make a message with provided cmd outputs
     """
     output = {'time': int(time.time())}
     for cmd in commands:
         try:
-            output[cmd] = json.loads(subprocess.check_output(cmd, shell=True, timeout=timeout).decode('utf8'))
+            output[cmd] = json.loads(await subprocess_output(cmd, shell=True, timeout=timeout))
         except subprocess.SubprocessError:
             pass
     if output:
@@ -883,9 +981,8 @@ class CephDumper:
         self.last_time_ops = defaultdict(set)  # type: Dict[int, Set[str]]
         self.first_cycle = True
 
-    def reload_pools(self) -> bool:
-        output = subprocess.check_output("ceph osd lspools -f json".split(), timeout=self.cmd_tout)
-        data = json.loads(output.decode("utf8"))
+    async def reload_pools(self) -> Awaitable[bool]:
+        data = json.loads(await subprocess_output("ceph osd lspools -f json", timeout=self.cmd_tout))
 
         new_pools_map = {}
         for idx, pool in enumerate(sorted(data, key=lambda x: x['poolname'])):
@@ -897,222 +994,178 @@ class CephDumper:
             return True
         return False
 
-    def dump_historic(self) -> List[FileRec]:
-        if self.not_inited_osd:
-            self.not_inited_osd = set_size_duration(self.not_inited_osd, self.size, self.duration,
-                                                    timeout=self.cmd_tout)
+    async def dump_historic(self) -> Awaitable[List[FileRec]]:
+        logger.info("historic called")
+        try:
+            if self.not_inited_osd:
+                self.not_inited_osd = await set_size_duration(self.not_inited_osd, self.size, self.duration,
+                                                              timeout=self.cmd_tout)
 
-        ctime = int(time.time())
-        osd_ops = {}  # type: Dict[int, str]
+            ctime = int(time.time())
+            osd_ops = {}  # type: Dict[int, str]
 
-        for osd_id in self.osd_ids:
-            if osd_id not in self.not_inited_osd:
+            for osd_id in self.osd_ids:
+                if osd_id not in self.not_inited_osd:
+                    try:
+                        osd_ops[osd_id] = await get_historic(osd_id)
+                        # data = get_historic_fast(osd_id)
+                    except (subprocess.CalledProcessError, OSError):
+                        self.not_inited_osd.add(osd_id)
+                        continue
+
+            result = []  # type: List[FileRec]
+            if await self.reload_pools():
+                if self.first_cycle:
+                    result.append((RecId.pools, self.pools_map))
+                else:
+                    # pools updated - skip this cycle, as different ops may came from pools before and after update
+                    return []
+
+            for osd_id, data in osd_ops.items():
                 try:
-                    osd_ops[osd_id] = get_historic(osd_id)
-                    # data = get_historic_fast(osd_id)
-                except (subprocess.CalledProcessError, OSError):
+                    parsed = json.loads(data)
+                except Exception:
+                    raise Exception(repr(data))
+
+                if self.size != parsed['size'] or self.duration != parsed['duration']:
                     self.not_inited_osd.add(osd_id)
                     continue
 
-        result = []  # type: List[FileRec]
-        if self.reload_pools():
-            if self.first_cycle:
-                result.append((RecId.pools, self.pools_map))
-            else:
-                # pools updated - skip this cycle, as different ops may came from pools before and after update
-                return []
+                ops = []
+                for op in parsed['ops']:
+                    try:
+                        if get_type(op) is not None:
+                            ops.append(CephOp.parse_op(op))
+                    except Exception:
+                        logger.exception("Failed to parse op: {}".format(pprint.pformat(op)))
 
-        for osd_id, data in osd_ops.items():
-            try:
-                parsed = json.loads(data)
-            except Exception:
-                raise Exception(repr(data))
+                ops = [op for op in ops if op.tp is not None and op.description not in self.last_time_ops[osd_id]]
+                if self.min_duration:
+                    ops = [op for op in ops if op.duration >= self.min_duration]
+                self.last_time_ops[osd_id] = {op.description for op in ops}
 
-            if self.size != parsed['size'] or self.duration != parsed['duration']:
-                self.not_inited_osd.add(osd_id)
-                continue
+                for op in ops:
+                    assert op.pack_pool_id is None
+                    op.pack_pool_id = self.pools_map_no_name[op.pool_id]
 
-            ops = []
-            for op in parsed['ops']:
-                try:
-                    if get_type(op) is not None:
-                        ops.append(CephOp.parse_op(op))
-                except Exception:
-                    logger.exception("Failed to parse op: {}".format(pprint.pformat(op)))
+                result.append((RecId.ops, (osd_id, ctime, ops)))
 
-            ops = [op for op in ops if op.tp is not None and op.description not in self.last_time_ops[osd_id]]
-            if self.min_duration:
-                ops = [op for op in ops if op.duration >= self.min_duration]
-            self.last_time_ops[osd_id] = {op.description for op in ops}
-
-            for op in ops:
-                assert op.pack_pool_id is None
-                op.pack_pool_id = self.pools_map_no_name[op.pool_id]
-
-            result.append((RecId.ops, (osd_id, ctime, ops)))
-
-        return result
+            return result
+        except Exception:
+            logger.exception("In dump_historic")
 
 
-InfoFunc = Callable[[], List[FileRec]]
 BinInfoFunc = Callable[[], List[BinaryFileRec]]
-
-
-def thread_func(handler: InfoFunc, packer: IPacker) -> List[BinaryFileRec]:
-    return list(packer.pack_iter(handler()))
 
 
 class DumpLoop:
     sigusr_requested_handlers = ["cluster_info", "pg_dump"]
 
-    def __init__(self, opts: Any, osd_ids: Set[int], fd: BinaryIO) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop, opts: Any, osd_ids: Set[int], fd: RecordFile) -> None:
         self.opts = opts
         self.osd_ids = osd_ids
         self.fd = fd
-        self.dump_requested = False
+        self.loop = loop
         self.packer = get_packer(opts.packer)
 
-        self.handlers = []  # type: List[Tuple[str, BinInfoFunc, float]]
+        # name => (func, timout, next_call)
+        self.handlers = {}  # type: Dict[str, Tuple[BinInfoFunc, float, float]]
         self.fill_handlers()
 
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(self.handlers))
+        self.running_handlers = set()  # type: Set[str]
+        loop.add_signal_handler(signal.SIGUSR1, self.sigusr1_handler)
 
-        ctime = time.time()
-        self.handlers_q = [(ctime, idx) for idx in range(len(self.handlers))]
-        heapq.heapify(self.handlers_q)
-
-        # Future -> HANDLER_IDX, FUTURE_START_TIME, FUTURE_NEXT_START_TIME
-        self.futures = {}  # type: Dict[concurrent.futures.Future, Tuple[int, float, float]]
-        signal.signal(signal.SIGUSR1, self.sigusr1_handler)
-
-    def sigusr1_handler(self, signum: Any, frame: Any) -> None:
-        logger.info("Get SIGUSR1, will dump data")
-        self.dump_requested = True
+    def start(self):
+        for name in self.handlers:
+            self.start_handler(name, repeat=True)
 
     def fill_handlers(self) -> None:
+        ctime = time.time()
         if self.opts.record_cluster != 0:
-            func = partial(dump_cluster_info, (RADOS_DF, CEPH_DF, CEPH_S), self.opts.timeout)  # type: InfoFunc
-            th_func = partial(thread_func, func, self.packer)  # type: BinInfoFunc
-            self.handlers.append(("cluster_info", th_func, self.opts.record_cluster))
+            func = partial(dump_cluster_info, (RADOS_DF, CEPH_DF, CEPH_S), self.opts.timeout)
+            self.handlers["cluster_info"] = func, self.opts.record_cluster, ctime
 
         if self.opts.record_pg_dump != 0:
             func = partial(dump_cluster_info, (PG_DUMP,), self.opts.timeout)
-            th_func = partial(thread_func, func, self.packer)
-            self.handlers.append(("pg_dump", th_func, self.opts.record_pg_dump))
+            self.handlers["pg_dump"] = func, self.opts.record_pg_dump, ctime
 
         dumper = CephDumper(self.osd_ids, self.opts.size, self.opts.duration, self.opts.timeout, self.opts.min_duration)
+        self.handlers["historic"] = dumper.dump_historic, self.opts.duration, ctime
 
-        func = partial(thread_func, dumper.dump_historic, self.packer)
-        self.handlers.append(("historic", func, self.opts.duration))
+    def start_handler(self, name: str, repeat: bool = False):
+        self.loop.create_task(self.run_handler(name, repeat))
 
-    def process_futures(self, max_time: float) -> None:
-        done, _ = concurrent.futures.wait(list(self.futures.keys()),
-                                          timeout=max_time,
-                                          return_when=concurrent.futures.FIRST_COMPLETED)
-        for fut in done:
-            idx, prev_time, next_time = self.futures.pop(fut)
-            name, _, tout = self.handlers[idx]
-            for rec_id, data in fut.result(timeout=0):
-                logger.debug("Handler %s provides %s bytes of data of type %s", name, len(data), rec_id)
-                write_record(self.fd, rec_id, data)
-
-            ctime = time.time()
-            if next_time - ctime < ctime - prev_time:
-                next_time = ctime + tout
-            heapq.heappush(self.handlers_q, (next_time, idx))
-
-    def schedule_handler(self, idx: int, curr_time: float) -> None:
-        _, func, tout = self.handlers[idx]
-        future = self.executor.submit(func)
-        self.futures[future] = (idx, curr_time, curr_time + tout)
-
-    def dump_all_info(self) -> None:
-        # call all info handlers due to user request
-        logger.info("Dumping data due to user request")
-        new_q = []
-
-        curr_time = time.time()
-        for call_time, idx in self.handlers_q:
-            name, func, tout = self.handlers[idx]
-            if name in self.sigusr_requested_handlers:
-                self.schedule_handler(idx, curr_time)
+    async def run_handler(self, name: str, repeat: bool = False, one_short_wait: int = 60):
+        run = True
+        if name in self.running_handlers:
+            if repeat:
+                run = False
             else:
-                new_q.append((call_time, idx))
+                for i in range(one_short_wait):
+                    await asyncio.sleep(1.0)
+                    if name not in self.running_handlers:
+                        run = True
+                        break
 
-        self.handlers_q = new_q
-        heapq.heapify(self.handlers_q)
+        if run:
+            handler, _, _ = self.handlers[name]
+            self.running_handlers.add(name)
+            data = await handler()
+            self.running_handlers.remove(name)
 
-    def mainloop_one_cycle(self, max_time: float) -> None:
-        ctime = time.time()
-        stop_time = ctime + max_time
-        wtime_left = stop_time - ctime
+            for rec_id, packed in self.packer.pack_iter(data):
+                logger.debug("Handler %s provides %s bytes of data of type %s", name, len(packed), rec_id)
+                self.fd.write_record(rec_id, packed)
 
-        while wtime_left >= 0:
-            loop_time = min(wtime_left, MAX_SLEEP_TIME)
-            loop_end_time = time.time() + loop_time
-            self.process_futures(loop_time)
+        if repeat:
+            handler, tout, next_time = self.handlers[name]
+            next_time += tout
+            curr_time = time.time()
+            sleep_time = next_time - curr_time
 
-            if self.dump_requested:
-                self.dump_all_info()
-                self.dump_requested = False
+            if sleep_time <= 0:
+                delta = (int(-sleep_time / tout) + 1) * tout
+                next_time += delta
+                sleep_time += delta
 
-            # start handlers
-            ctime = time.time()
-            if self.handlers_q and self.handlers_q[0][0] <= ctime:
-                call_time, idx = heapq.heappop(self.handlers_q)
-                self.schedule_handler(idx, ctime)
+            assert sleep_time > 0
+            self.handlers[name] = handler, tout, next_time
+            self.loop.call_later(sleep_time, self.start_handler, name, True)
 
-            loop_time_left = loop_end_time - ctime
-            if loop_time_left > 0:
-                time.sleep(loop_time_left)
-
-            wtime_left = stop_time - time.time()
-
-
-def dump_loop(opts: Any, osd_ids: Set[int], fd: BinaryIO) -> None:
-    looper = DumpLoop(opts, osd_ids, fd)
-    while True:
-        looper.mainloop_one_cycle(1)
-
-
-def seek_to_last_valid_record(fd: BinaryIO) -> Optional[bytes]:
-    header = read_header(fd)
-
-    if header is None:
-        return None
-
-    try:
-        for _ in iter_records(fd):
-            pass
-    except (UnexpectedEOF, AssertionError, ValueError):
-        logger.warning("File corrupted after offset %d. Truncate to last valid offset", fd.tell())
-        fd.truncate()
-
-    return header
+    def sigusr1_handler(self) -> None:
+        logger.info("Get SIGUSR1, will dump data")
+        for name in self.sigusr_requested_handlers:
+            if name in self.handlers:
+                self.start_handler(name)
 
 
-def record_to_file(opts: Any) -> int:
+async def record_to_file(loop: asyncio.AbstractEventLoop, opts: Any) -> Awaitable[int]:
     logger.info("Start recording with opts = %s", " ".join(sys.argv))
     params = {'packer': opts.packer, 'cmd': sys.argv,
               'node': [socket.gethostname(), socket.getfqdn()]}
     try:
-        osd_ids = get_local_osds()
+        osd_ids = await get_local_osds()
         logger.info("osds = %s", osd_ids)
 
-        with cast(BinaryIO, open_to_append(opts.output_file, True)) as fd:
-            fd.seek(0, os.SEEK_SET)
-            header = seek_to_last_valid_record(fd)
+        with cast(BinaryIO, open_to_append(opts.output_file, True)) as os_fd:
+            os_fd.seek(0, os.SEEK_SET)
+            fd = RecordFile(os_fd)
+            header = fd.seek_to_last_valid_record()
 
             if header is None:
-                fd.seek(0, os.SEEK_SET)
-                fd.write(HEADER_LAST)
+                os_fd.seek(0, os.SEEK_SET)
+                os_fd.write(HEADER_LAST)
             else:
                 assert header == HEADER_LAST, "Can only append to file with {} version".format(HEADER_LAST_NAME)
 
-            write_record(fd, RecId.params, json.dumps(params).encode("utf8"))
-            dump_loop(opts, osd_ids, fd)
+            fd.write_record(RecId.params, json.dumps(params).encode("utf8"))
+            DumpLoop(loop, opts, osd_ids, fd).start()
+            while True:
+                await asyncio.sleep(0.1)
     except UTExit:
         raise
+    except (KeyboardInterrupt, SystemExit):
+        pass
     except Exception as exc:
         logger.exception("During recording")
         if isinstance(exc, OSError):
@@ -1121,8 +1174,9 @@ def record_to_file(opts: Any) -> int:
     return 0
 
 
-def parse(fd: BinaryIO) -> Iterator[Tuple[RecId, Any]]:
-    header = read_header(fd)
+def parse(os_fd: BinaryIO) -> Iterator[Tuple[RecId, Any]]:
+    fd = RecordFile(os_fd)
+    header = fd.read_file_header()
     if header is None:
         return
 
@@ -1130,7 +1184,7 @@ def parse(fd: BinaryIO) -> Iterator[Tuple[RecId, Any]]:
     if header == HEADER_V11:
         packer = CompactPacker
 
-    riter = iter_records(fd)
+    riter = fd.iter_records()
     pools_map = None  # type: Optional[Dict[int, Tuple[str, int]]]
 
     for rec_type, data in riter:
@@ -1223,6 +1277,25 @@ def setup_logger(configurable_logger: logging.Logger, log_level: str, log: str =
     configurable_logger.addHandler(ch)
 
 
+async def async_main(loop: asyncio.AbstractEventLoop, opts: Any) -> Awaitable[int]:
+    if opts.subparser_name in ('set', 'set_default'):
+        if opts.subparser_name == 'set':
+            duration = opts.duration
+            size = opts.size
+        else:
+            duration = DEFAULT_DURATION
+            size = DEFAULT_SIZE
+        osd_ids = await get_local_osds()
+        failed_osds = await set_size_duration(osd_ids, duration=duration, size=size)
+        if failed_osds:
+            logger.error("Fail to set time/duration for next osds: %s", " ,".join(map(str, osd_ids)))
+            return 1
+        return 0
+    else:
+        assert opts.subparser_name == 'record'
+        return await record_to_file(loop, opts)
+
+
 def main(argv: List[str]) -> int:
     opts = parse_args(argv)
     setup_logger(logger, opts.log_level, opts.log)
@@ -1231,16 +1304,13 @@ def main(argv: List[str]) -> int:
         print_records_from_file(opts.file, opts.limit)
         return 0
 
-    if opts.subparser_name == 'set':
-        set_size_duration(get_local_osds(), duration=opts.duration, size=opts.size)
-        return 0
-
-    if opts.subparser_name == 'set_default':
-        set_size_duration(get_local_osds(), duration=DEFAULT_DURATION, size=DEFAULT_SIZE)
-        return 0
-
-    assert opts.subparser_name == 'record'
-    return record_to_file(opts)
+    loop = asyncio.get_event_loop()
+    try:
+        return loop.run_until_complete(async_main(loop, opts))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":

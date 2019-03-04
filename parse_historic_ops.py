@@ -1,15 +1,11 @@
-import collections
-
-import itertools
-import json
 import sys
-from enum import Enum
-
 import math
 import logging
 import argparse
-from typing import Iterator, Tuple, Iterable, List, Dict, Set, Any, cast, Optional, Sequence, Union, NamedTuple, \
-    Mapping, MutableMapping
+import itertools
+import collections
+from enum import Enum
+from typing import Iterator, Tuple, Iterable, List, Dict, Any, cast, Optional, Union, NamedTuple, MutableMapping
 
 import numpy
 import pandas
@@ -17,7 +13,7 @@ import matplotlib
 from matplotlib import pyplot
 from dataclasses import dataclass, field
 
-import ceph_ho_dumper_async as ceph_ho_dumper
+import ceph_ho_dumper
 
 
 matplotlib.rcParams.update({'font.size': 30, 'lines.linewidth': 5})
@@ -25,132 +21,7 @@ matplotlib.rcParams.update({'font.size': 30, 'lines.linewidth': 5})
 
 logger = logging.getLogger()
 
-#
-#
-# def show_per_pg_stat(ops: Iterable[OP]):
-#     per_pg = Counter()
-#     total_per_pool = Counter()
-#     all_pg = set()
-#
-#     for op in ops:
-#         if op.io_type == IO_WRITE:
-#             per_pg[op.pg] += 1
-#             pool, _ = op.pg.split(".")
-#             total_per_pool[pool] += 1
-#             all_pg.add(op.pg)
-#
-#     total_117_pg = len([pg for pg in all_pg if pg.startswith("117.")])
-#
-#     print(f"total pg 117 = {total_117_pg}")
-#     tt = 0
-#     for pg, count in sorted(((pg, cnt) for pg, cnt in per_pg.items() if pg.startswith("117.")), key=lambda x: -x[1])[:20]:
-#         pool, _ = pg.split(".")
-#         print(f"{pg:>8s}  {count:>8d}   {round(count * 1000 / total_per_pool[pool]) / 10:1.1f}%")
-#         tt += count
-#     print(f"Total for first 20 = {tt / total_per_pool['117'] * 100:.1f}%")
-#
-#
-# def per_PG_OSD_stat(all_ops: List[OP], pg_map: Dict):
-#     longer_100ms = list(filter_duration(all_ops, 100))
-#     # longer_1s = list(filter_duration(all_ops, 1000, 10000))
-#     # longer_10s = list(filter_duration(all_ops, 10000, 100000))
-#
-#     print("Reads most slow OSDS")
-#     top_slow_osds(filter_iotype(longer_100ms, {IO_READ}), pg_map, True)
-#
-#     print("Writes most slow OSDS")
-#     print("------------- 100ms -----------------")
-#     top_slow_osds(filter_iotype(longer_100ms, {IO_WRITE}), pg_map)
-#
-#     print("Reads most slow PGS")
-#     print("------------- 100ms -----------------")
-#     top_slow_pgs(filter_iotype(longer_100ms, {IO_READ}))
-#
-#     print("Writes most slow PGS")
-#     print("------------- 100ms -----------------")
-#     top_slow_pgs(filter_iotype(longer_100ms, {IO_WRITE}))
-#
-#
-# def stages_stat(ops: List[OP]):
-#     longer_100ms = list(filter_duration(ops, 0, 450))
-#     longer_300ms = list(filter_duration(ops, 450, 800))
-#     longer_1s = list(filter_duration(ops, 800))
-#
-#     print("OP")
-#
-#     for lst in (longer_100ms, longer_300ms, longer_1s):
-#         stage_times = defaultdict(int)
-#         for op in filter_optype(filter_iotype(lst, {IO_WRITE}), {OSD_OP}):
-#             try:
-#                 stage_times["dload"] += op.dload_time()
-#                 stage_times["waiting_for_pg"] += op.waiting_for_pg()
-#                 stage_times["waiting_for_subop"] += op.waiting_for_subop()
-#                 stage_times["local"] += op.local_time()
-#             except:
-#                 # print(op)
-#                 pass
-#
-#         for stage in ("dload", "waiting_for_pg", "waiting_for_subop", "local"):
-#             print(f"{stage:>20s}  {stage_times[stage] // 1000:>6d}")
-#         print()
-#
-#     print("REPOP")
-#
-#     for lst in (longer_100ms, longer_300ms, longer_1s):
-#         stage_times = defaultdict(int)
-#         for op in filter_optype(lst, {OSD_REPOP}):
-#             try:
-#                 stage_times["dload"] += op.dload_time()
-#                 stage_times["waiting_for_pg"] += op.waiting_for_pg()
-#                 stage_times["local"] += op.local_time()
-#             except:
-#                 print(op)
-#                 pass
-#
-#         for stage in ("dload", "waiting_for_pg", "local"):
-#             print(f"{stage:>20s}  {stage_times[stage] // 1000:>6d}")
-#         print()
-#
-#
-# def stat_by_slowness(all_ops: List[OP]):
-#     slow_due_to = {'net': [], 'pg': [], 'disk': []}
-#     for op in all_ops:
-#         try:
-#             disk = op.local_time()
-#             net = op.dload_time()
-#             pg = op.waiting_for_pg()
-#         except:
-#             continue
-#
-#         if disk >= net and disk >= pg:
-#             slow_due_to['disk'].append(op.duration)
-#         elif net >= disk and net >= pg:
-#             slow_due_to['net'].append(op.duration)
-#         else:
-#             assert pg >= disk and pg >= net
-#             slow_due_to['pg'].append(op.duration)
-#
-#     for key, durations in slow_due_to.items():
-#         durations.sort()
-#
-#         ld = len(durations)
-#         avg = int(sum(durations) / ld)
-#         p50 = durations[ld // 2]
-#         p05 = durations[int(ld * 0.05)]
-#         p95 = durations[int(ld * 0.95)]
-#
-#         print(f"{key:>8s} {len(durations):>8d} {int(sum(durations) / 1000):>6d}s  {avg:>6d}ms {p05:>6d} {p50:>6d} {p95:>6d}")
-#
-#
-# def load_json(fname: str) -> List[OP]:
-#     all_ops = []
-#     with open(fname, 'r') as fd:
-#         for op_tp in json.load(fd):
-#             all_ops.append(OP(*op_tp))
-#     return all_ops
 
-
-#
 # def analyze_pgs(pg1_path: str, pg2_path: str):
 #     pg_dump1 = json.load(open(pg1_path))
 #     pg_dump2 = json.load(open(pg2_path))
@@ -213,36 +84,6 @@ logger = logging.getLogger()
 #     print(f"   95perc   {int(p95):>10d}")
 #     print(f"      max   {rdiff[-1]:>10d}")
 #
-#
-#
-# def show_histo(df: pandas.DataFrame):
-#     for name, selector in iter_classes_selector(df):
-#         for is_read in (True, False):
-#             if is_read:
-#                 io_selector = df['op_type'] == ceph_ho_dumper.OP_READ
-#             else:
-#                 io_selector = (df['op_type'] == ceph_ho_dumper.OP_WRITE_SECONDARY) | \
-#                               (df['io_type'] == ceph_ho_dumper.OP_WRITE_PRIMARY)
-#
-#             bins = numpy.array([25, 50, 100, 200, 300, 500, 700] +
-#                                [1000, 3000, 5000, 10000, 20000, 30000, 100000])
-#             times = df['duration'][io_selector & selector]
-#             res, _ = numpy.histogram(times, bins)
-#             res[-2] += res[-1]
-#             print(f"\n-----------------------\n{'read' if is_read else 'write'} for class {name}")
-#             for start, stop, res in zip(bins[1:-2], bins[2:-1], res[1:-1]):
-#                 if res != 0:
-#                     print(f"{start:>5d}ms ~ {stop:>5d}ms  {res:>8d}")
-#
-#
-# @dataclass
-# class OpsData:
-#     pg_before: Dict
-#     pg_after: Dict
-#     all_df: pandas.DataFrame
-#     slow_df: pandas.DataFrame
-#     pools2classes: Dict[str, Set[int]]
-
 
 # -------  COMMON FUNCTIONS  -------------------------------------------------------------------------------------------
 
