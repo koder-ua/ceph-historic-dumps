@@ -7,20 +7,22 @@ set -o errexit
 
 # Tool options
 readonly PACKER=compact
-
 readonly MIN_DURATION=10
 readonly RECORD_DURATION=60
 readonly RECORD_SIZE=300
 readonly DEFAULT_TAIL_LINES=20
 readonly PRIMARY_OPTS="--record-cluster 300 --record-pg-dump 1800"
 readonly DUMP_HEADERS=""
+readonly LOG_LEVEL="INFO"
+readonly STATUS_CONN_PORT=16677
+readonly STATUS_CONN_ADDR="0.0.0.0:${STATUS_CONN_PORT}"
 
 readonly TEST_MIN_DURATION=5
 readonly TEST_RECORD_DURATION=10
 readonly TEST_RECORD_SIZE=300
 readonly TEST_PRIMARY_OPTS="--record-cluster 30 --record-pg-dump 60"
 readonly TEST_DUMP_HEADERS="--dump-unparsed-headers"
-
+readonly TEST_LOG_LEVEL="DEBUG"
 
 readonly ALL_NODES="ceph01 ceph02 ceph03"
 #readonly ALL_NODES="osd001 osd002 osd003 osd004 osd005 osd006 osd007 osd008 osd009 osd010 osd011 osd012"
@@ -30,14 +32,16 @@ readonly ALL_NODES="ceph01 ceph02 ceph03"
 #readonly ALL_NODES="$ALL_NODES1 ceph30 ceph31 ceph32 ceph33 ceph34 ceph35 ceph36 ceph38 ceph39 ceph40 ceph41 ceph42"
 
 # ALMOST CONSTANT
+readonly MAX_COMMUNICATION_TIMEOUT=15
 readonly PYTHON="/usr/bin/python3.5"
-readonly BIN=ceph_ho_dumper.py
+readonly BIN="ceph_ho_dumper.py"
 readonly TARGET="/tmp/${BIN}"
 readonly SHELL="/bin/bash"
-readonly LOG=/tmp/ceph_ho_dumper.log
-readonly RESULT=/tmp/historic_ops_dump.bin
-readonly SRV_FILE=mira-ceph-ho-dumper.service
-readonly FORCE_DUMP_SIGNAL=SIGUSR1
+readonly LOG="/tmp/ceph_ho_dumper.log"
+readonly RESULT="/tmp/historic_ops_dump.bin"
+readonly SRV_FILE="mira-ceph-ho-dumper.service"
+readonly FORCE_DUMP_SIGNAL="SIGUSR1"
+readonly MAX_PG_WAIT_TIME="60"
 
 
 # CONSTANTS
@@ -54,7 +58,6 @@ readonly SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -
 readonly SSH_CMD="ssh ${SSH_OPTS} "
 readonly SCP_CMD="scp ${SSH_OPTS} "
 readonly SERVICE="${SRV_FILE}"
-readonly MIN_DUMP_SIZE_DIFF=$((64 * 1024))
 
 readonly _RES_DIR=$(dirname "${RESULT}")
 readonly _RES_BASE=$(basename "${RESULT}")
@@ -169,6 +172,13 @@ function do_scp {
     ${SCP_CMD} "${source}" "${target}"
 }
 
+function clean_output {
+    local -r nodes="${1}"
+    for node in ${nodes} ; do
+        do_ssh "${node}" "rm --force '${LOG}' '${RESULT}' || true"
+    done
+}
+
 function clean {
     local -r nodes="${1}"
     local cmd
@@ -197,10 +207,10 @@ function clean {
                 printf "%bFailed to set duration for node %s%b\n" "${RED}" "${node}" "${NO_COLOR}"
                 code="${set_code}"
             fi
+            do_ssh "${node}" "rm --force '${TARGET}' '${LOG}' '${RESULT}' || true"
         fi
-
-        do_ssh "${node}" "rm --force '${TARGET}' '${LOG}' '${RESULT}' || true"
     done
+
     if [[ "$code" != "0" ]] ; then
         exit "${code}"
     fi
@@ -242,6 +252,8 @@ function deploy {
             srv_file=$(sed --expression "s/{DURATION}/${TEST_RECORD_DURATION}/" \
                            --expression "s/{SIZE}/${TEST_RECORD_SIZE}/" \
                            --expression "s/{PACKER}/${PACKER}/" \
+                           --expression "s/{STATUS_CONN_ADDR}/${STATUS_CONN_ADDR}/" \
+                           --expression "s/{LOG_LEVEL}/${TEST_LOG_LEVEL}/" \
                            --expression "s/{DUMP_UNKNOWN_HEADERS}/${DUMP_HEADERS}/" \
                            --expression "s/{MIN_DURATION}/${TEST_MIN_DURATION}/" \
                            --expression "s/{PRIMARY}/${popt}/" \
@@ -254,6 +266,8 @@ function deploy {
             srv_file=$(sed --expression "s/{DURATION}/${RECORD_DURATION}/" \
                            --expression "s/{SIZE}/${RECORD_SIZE}/" \
                            --expression "s/{PACKER}/${PACKER}/" \
+                           --expression "s/{STATUS_CONN_ADDR}/${STATUS_CONN_ADDR}/" \
+                           --expression "s/{LOG_LEVEL}/${LOG_LEVEL}/" \
                            --expression "s/{DUMP_UNKNOWN_HEADERS}/${DUMP_HEADERS}/" \
                            --expression "s/{MIN_DURATION}/${MIN_DURATION}/" \
                            --expression "s/{PRIMARY}/${popt}/" \
@@ -368,17 +382,45 @@ function restart {
 
 function force_dump_info {
     local -r node="${1}"
+    local -r wait="${2}"
+    local curr_pg_dump_time
+    local end_wait_time
+    local new_size
+
+    if [[ "${wait}" == "1" ]] ; then
+        curr_pg_dump_time=$(get_pg_dump_time "${node}" "${STATUS_CONN_PORT}" "${MAX_COMMUNICATION_TIMEOUT}")
+    fi
+
     do_ssh_sudo "${node}" "systemctl kill -s ${FORCE_DUMP_SIGNAL} ${SERVICE}"
+
+    if [[ "${wait}" == "1" ]] ; then
+        echo "Waiting for primary node(${node}) to complete PG dump, max ${MAX_PG_WAIT_TIME} seconds"
+        end_wait_time=$(($(date +%s) + MAX_PG_WAIT_TIME))
+
+        while (( $(date +%s) <= end_wait_time )) ; do
+            new_size=$(get_pg_dump_time "${node}" "${STATUS_CONN_PORT}" "${MAX_COMMUNICATION_TIMEOUT}")
+            if [[ "${curr_pg_dump_time}" != "${new_size}" ]] ; then
+                break
+            fi
+            sleep 1
+        done
+    fi
 }
 
 function collect {
     local -r nodes="${1}"
     local -r target_dir="${2}"
+    local -r collect_logs="${3}"
+
     local -r result_basename="$(basename "${RESULT}")"
+    local -r log_basename="$(basename "${LOG}")"
 
     pushd "${target_dir}" >/dev/null
     for node in ${nodes} ; do
         do_scp "${node}:${RESULT}" "${node}-${result_basename}"
+        if [[ "${collect_logs}" == "1" ]] ; then
+            do_scp "${node}:${LOG}" "${node}-${log_basename}"
+        fi
     done
     popd  >/dev/null
 }
@@ -393,6 +435,14 @@ function redeploy {
     start "${nodes}"
 }
 
+function get_pg_dump_time {
+    local -r node="${1}"
+    local -r port="${2}"
+    local -r max_timeout="${3}"
+    echo 'info' | nc -w "${max_timeout}" "${node}" "${port}" | \
+        json_pp | grep '"pg_dump" :' | awk '{print $3}' | sed 's/,//'
+}
+
 function main {
     local tgt=""
     local jobs="${DEFAULT_JOBS}"
@@ -401,6 +451,8 @@ function main {
     local parallel_prefix=""
     local no_dump_info="0"
     local test="0"
+    local collect_logs="0"
+    local wait_for_update="0"
 
     local -r command="${1}"
     shift
@@ -411,10 +463,6 @@ function main {
             jobs="${2}"
             shift
             ;;
-        --target)
-            tgt="${2}"
-            shift
-            ;;
         --lines)
             tail_lines="${2}"
             shift
@@ -422,11 +470,25 @@ function main {
         --parallel|-P)
             parallel="1"
             ;;
+        --test)
+            test="1"
+            ;;
+        --target)
+            tgt="${2}"
+            shift
+            ;;
         --no-dump-info)
             no_dump_info="1"
             ;;
-        --test)
-            test="1"
+        --collect-logs)
+            collect_logs="1"
+            ;;
+        --wait-for-update)
+            wait_for_update="1"
+            ;;
+        *)
+            echo "Unknown extra option ${1}" 1>&2
+            exit 1
             ;;
         esac
         shift
@@ -457,15 +519,13 @@ function main {
         ;;
     -l|--collect)
         if [[ "${no_dump_info}" == "0" ]] ; then
-            force_dump_info "${first_node}"
-            echo "Waiting for 15s for primary node to complete PG dump"
-            sleep 15
+            force_dump_info "${first_node}" "1"
         fi
 
         if [[ "${tgt}" != "" ]] && [[ ! -d "${tgt}" ]] ; then
             mkdir --parents "${tgt}"
         fi
-        ${parallel_prefix} collect "${ALL_NODES}" "${tgt}"
+        ${parallel_prefix} collect "${ALL_NODES}" "${tgt}" "${collect_logs}"
         ;;
     -r|--redeploy)
         ${parallel_prefix} redeploy "${ALL_NODES}" "${first_node}" "${test}"
@@ -482,7 +542,7 @@ function main {
         fi
         ;;
     -f|--force-dump-info)
-        force_dump_info "${first_node}"
+        force_dump_info "${first_node}" "${wait_for_update}"
         ;;
     -t|--tail)
         if [[ "${parallel}" == "1" ]] ; then
@@ -492,6 +552,11 @@ function main {
         tails "${ALL_NODES}" "${tail_lines}"
         shift
         ;;
+    -C|--clean-output)
+        ${parallel_prefix} stop "${ALL_NODES}"
+        ${parallel_prefix} clean_output "${ALL_NODES}"
+        ${parallel_prefix} start "${ALL_NODES}"
+        ;;
     -S|--start)
         ${parallel_prefix} start "${ALL_NODES}"
         ;;
@@ -500,6 +565,20 @@ function main {
         ;;
     -R|--restart)
         ${parallel_prefix} restart "${ALL_NODES}"
+        ;;
+    -p|--pack)
+        local -r result_file="last.tar"
+        local -r log_arch=logs.tar.bz2
+        tar cvjf "${log_arch}" *.log
+        tar cvf "${result_file}" "${log_arch}" *.bin
+        rm -f "${log_arch}"
+        ;;
+    --unpack)
+        local -r result_file="last.tar"
+        local -r log_arch=logs.tar.bz2
+        tar xvf "${result_file}"
+        tar xvjf "${log_arch}"
+        rm -f "${log_arch}"
         ;;
     *)
         echo "Incorrect option provided ${command}" 1>&2

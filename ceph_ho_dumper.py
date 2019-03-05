@@ -81,6 +81,13 @@ class RecId(Enum):
     packed = 5
 
 
+class ParseResult(Enum):
+    ok = 0
+    failed = 1
+    ignored = 2
+    unknown = 3
+
+
 HEADER_V11 = b"OSD OPS LOG v1.1\0"
 HEADER_V12 = b"OSD OPS LOG v1.2\0"
 HEADER_LAST = HEADER_V12
@@ -335,14 +342,9 @@ def get_pool_pg(rr: Match) -> Tuple[int, int]:
     return int(rr.group('pool')), int(rr.group('pg'), 16)
 
 
-class ParseResult(Enum):
-    ok = 0
-    failed = 1
-    ignored = 2
-    unknown = 3
-
-
-ignored_tps = {'delete', 'call', 'watch', 'stat'}
+ignored_tps = {'delete', 'call', 'watch', 'stat', 'notify-ack'}
+ignored_types = {"osd_repop_reply", "pg_info", "replica scrub", "rep_scrubmap", "pg_update_log_missing",
+                 "MOSDScrubReserve"}
 
 
 def parse_description(descr: str) -> Tuple[ParseResult, Optional[OpDescription]]:
@@ -370,7 +372,7 @@ def parse_description(descr: str) -> Tuple[ParseResult, Optional[OpDescription]]
             OpDescription(OpType.write_secondary, rr.group('client'), pool, pg, rr.group('obj_name'), None)
 
     raw_tp = descr.split("(", 1)[0]
-    if raw_tp in ("osd_repop_reply", "pg_info"):
+    if raw_tp in ignored_types:
         return ParseResult.ignored, None
     elif raw_tp == 'osd_op':
         for info in descr.split("[", 1)[1].split("]", 1)[0].split(","):
@@ -1060,7 +1062,6 @@ class CephDumper:
         return False
 
     async def dump_historic(self) -> Awaitable[List[FileRec]]:
-        logger.info("historic called")
         try:
             if self.not_inited_osd:
                 self.not_inited_osd = await set_size_duration(self.not_inited_osd, self.size, self.duration,
@@ -1105,7 +1106,7 @@ class CephDumper:
                         if ceph_op:
                             ops.append(ceph_op)
                         elif parse_res == ParseResult.unknown:
-                            logger.debug("UNKNOWN: %s", op['description'])
+                            logger.info("UNKNOWN: %s", op['description'])
                     except Exception:
                         parse_res = ParseResult.failed
 
@@ -1147,10 +1148,48 @@ class DumpLoop:
 
         self.running_handlers = set()  # type: Set[str]
         loop.add_signal_handler(signal.SIGUSR1, self.sigusr1_handler)
+        self.server = None
+        self.status = {
+            'last_handler_run_at': {}
+        }  # type: Dict[str, Any]
 
-    def start(self):
+    async def close(self):
+        if self.server:
+            self.server.close()
+            self.loop.run_until_complete(self.server.wait_closed())
+            self.server = None
+
+    async def handle_conn(self, reader: asyncio.StreamReader, writer):
+        addr = writer.get_extra_info('peername')
+        logger.debug("Get new conn from %s", addr)
+        cmd = (await reader.readline()).decode('utf8').strip()
+        logger.debug("Get cmd %s from %s", cmd, addr)
+        if cmd == 'info':
+            data = self.status.copy()
+            data.update({"error": 0, "message": "Success"})
+            writer.write(json.dumps(data).encode('utf8'))
+            await writer.drain()
+            logger.debug("Successfully send respond to %s", addr)
+        else:
+            logger.warning("Unknown cmd %s from %s", cmd, addr)
+            data = json.dumps({"error": 1, "message": "Unknown cmd {!r}".format(cmd)})
+            writer.write(data.encode('utf8'))
+            await writer.drain()
+
+        writer.close()
+
+    async def start_info_server(self, addr: str):
+        ip, port_s = addr.split(":")
+        logger.info("Start server on addr %s", addr)
+        port = int(port_s)
+        self.server = await asyncio.start_server(self.handle_conn, ip, port, loop=self.loop)
+
+    async def start(self):
         for name in self.handlers:
             self.start_handler(name, repeat=True)
+
+        if self.opts.server_addr:
+            await self.start_info_server(self.opts.server_addr)
 
     def fill_handlers(self) -> None:
         ctime = time.time()
@@ -1186,6 +1225,7 @@ class DumpLoop:
             self.running_handlers.add(name)
             data = await handler()
             self.running_handlers.remove(name)
+            self.status['last_handler_run_at'][name] = int(time.time())
 
             for rec_id, packed in self.packer.pack_iter(data):
                 logger.debug("Handler %s provides %s bytes of data of type %s", name, len(packed), rec_id)
@@ -1216,7 +1256,10 @@ class DumpLoop:
 async def record_to_file(loop: asyncio.AbstractEventLoop, opts: Any) -> Awaitable[int]:
     logger.info("Start recording with opts = %s", " ".join(sys.argv))
     params = {'packer': opts.packer, 'cmd': sys.argv,
-              'node': [socket.gethostname(), socket.getfqdn()]}
+              'node': [socket.gethostname(), socket.getfqdn()],
+              'time': time.time(),
+              'date': str(datetime.datetime.now()),
+              'tz_offset': time.localtime().tm_gmtoff}
     try:
         osd_ids = await get_local_osds()
         logger.info("osds = %s", osd_ids)
@@ -1233,9 +1276,16 @@ async def record_to_file(loop: asyncio.AbstractEventLoop, opts: Any) -> Awaitabl
                 assert header == HEADER_LAST, "Can only append to file with {} version".format(HEADER_LAST_NAME)
 
             fd.write_record(RecId.params, json.dumps(params).encode("utf8"))
-            DumpLoop(loop, opts, osd_ids, fd).start()
-            while True:
-                await asyncio.sleep(0.1)
+
+            dl = DumpLoop(loop, opts, osd_ids, fd)
+            await dl.start()
+            try:
+                while True:
+                    await asyncio.sleep(0.1)
+            finally:
+                # await dl.close()
+                raise
+
     except UTExit:
         raise
     except (KeyboardInterrupt, SystemExit):
@@ -1313,6 +1363,7 @@ def parse_args(argv: List[str]) -> Any:
     subparsers.add_parser('set_default', help="config osd's historic ops to default 20/600")
 
     record_parser = subparsers.add_parser('record', help="Dump osd's requests periodically")
+    record_parser.add_argument("--server-addr", default=None, help="TCP addr for status socket")
     record_parser.add_argument("--duration", required=True, type=int, help="Duration to keep")
     record_parser.add_argument("--size", required=True, type=int, help="Num request to keep")
     record_parser.add_argument("--timeout", type=int, default=30, help="Timeout to run cli cmds")
