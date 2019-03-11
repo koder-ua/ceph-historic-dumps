@@ -1,5 +1,5 @@
 * add total executed ops from rados df to all stat outputs
 * store client ID for op
 * record osd performance metrics
-* add status socket
-* add reload option to drop record file
+* save pg mapping to osd
+* parallel load

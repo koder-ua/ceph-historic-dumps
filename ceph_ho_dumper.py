@@ -1,9 +1,11 @@
 #!/usr/bin/env python3.5
+import http
 import os
 import re
 import sys
 import bz2
 import abc
+import traceback
 from io import BytesIO
 
 import math
@@ -40,25 +42,8 @@ S_TO_MS = 1000
 DEFAULT_DURATION = 600
 DEFAULT_SIZE = 20
 
-MAX_SRC_VL = 100000
-MIN_SRC_VL = 1
-MAX_TARGET_VL = 254
-MIN_TARGET_VL = 1
-TARGET_UNDERVAL = 0
-TARGET_OVERVAL = 255
 MAX_PG_VAL = (2 ** 16 - 1)
 MAX_POOL_VAL = 63
-UNDISCRETIZE_UNDERVAL = 0
-UNDISCRETIZE_OVERVAL = MAX_SRC_VL
-
-assert MIN_SRC_VL >= 1
-assert MAX_SRC_VL > MIN_SRC_VL
-assert TARGET_OVERVAL > MAX_TARGET_VL > MIN_TARGET_VL > TARGET_UNDERVAL
-assert UNDISCRETIZE_UNDERVAL <= MIN_SRC_VL < MAX_SRC_VL <= UNDISCRETIZE_OVERVAL
-
-SCALE_COEF = (MAX_TARGET_VL - MIN_TARGET_VL) / (math.log10(MAX_SRC_VL) - math.log10(MIN_SRC_VL))
-STEP_COEF = 1.036824
-
 
 MAX_SLEEP_TIME = 0.01
 
@@ -114,41 +99,23 @@ class UTExit(Exception):
 
 
 class DiscretizerExt:
-    table = [1]
-    prev = table[-1]
-    for _ in range(255):
-        prev = max(round(STEP_COEF * prev), prev + 1)
-        table.append(prev)
+    # discretization constants
+    overfloat = 255
+    step_coef = 1.0372259
+
+    val = 0
+    table = [val]
+    for _ in range(254):
+        val = max(round(step_coef * val), val + 1)
+        table.append(val)
 
     @classmethod
     def discretize(cls, vl: float) -> int:
-        return bisect.bisect_left(cls.table, vl)
+        return min(cls.overfloat, bisect.bisect_left(cls.table, round(vl)))
 
     @classmethod
     def undiscretize(cls, vl: int) -> int:
         return cls.table[vl]
-
-
-def discretize(vl: float) -> int:
-    if vl > MAX_SRC_VL:
-        return TARGET_OVERVAL
-    if vl < MIN_SRC_VL:
-        return TARGET_UNDERVAL
-    assert vl >= 0
-    res = round(math.log10(vl) * SCALE_COEF) + MIN_TARGET_VL
-    assert MAX_TARGET_VL >= res >= MIN_TARGET_VL
-    return res
-
-
-def undiscretize(vl: int) -> float:
-    if vl == TARGET_UNDERVAL:
-        return UNDISCRETIZE_UNDERVAL
-    if vl == TARGET_OVERVAL:
-        return UNDISCRETIZE_OVERVAL
-    return 10 ** ((vl - MIN_TARGET_VL) / SCALE_COEF)
-
-
-undiscretize_map = {vl: undiscretize(vl) for vl in range(256)}  # type: Dict[int, float]
 
 
 def to_unix_ms(dtm: str) -> int:
@@ -594,29 +561,29 @@ class CompactPacker(IPacker):
 
         if op.tp == OpType.write_primary:
             return cls.OPRecortWP.pack(flags_and_pool, pg,
-                                       discretize(op.duration),
-                                       discretize(timings.wait_for_pg),
-                                       discretize(timings.download),
-                                       discretize(timings.local_io),
-                                       discretize(timings.wait_for_replica))
+                                       DiscretizerExt.discretize(op.duration),
+                                       DiscretizerExt.discretize(timings.wait_for_pg),
+                                       DiscretizerExt.discretize(timings.download),
+                                       DiscretizerExt.discretize(timings.local_io),
+                                       DiscretizerExt.discretize(timings.wait_for_replica))
 
         if op.tp == OpType.write_secondary:
             return cls.OPRecortWS.pack(flags_and_pool, pg,
-                                       discretize(op.duration),
-                                       discretize(timings.wait_for_pg),
-                                       discretize(timings.download),
-                                       discretize(timings.local_io))
+                                       DiscretizerExt.discretize(op.duration),
+                                       DiscretizerExt.discretize(timings.wait_for_pg),
+                                       DiscretizerExt.discretize(timings.download),
+                                       DiscretizerExt.discretize(timings.local_io))
 
         assert op.tp == OpType.read, "Unknown op type {}".format(op.tp)
         return cls.OPRecortR.pack(flags_and_pool, pg,
-                                  discretize(op.duration),
-                                  discretize(timings.wait_for_pg),
-                                  discretize(timings.download))
+                                  DiscretizerExt.discretize(op.duration),
+                                  DiscretizerExt.discretize(timings.wait_for_pg),
+                                  DiscretizerExt.discretize(timings.download))
 
     @classmethod
     def unpack_op(cls, data: bytes, offset: int) -> Tuple[Dict[str, Any], int]:
 
-        undiscretize_l = undiscretize_map.__getitem__  # type: Callable[[int], float]
+        undiscretize_l = DiscretizerExt.table.__getitem__  # type: Callable[[int], float]
         flags_and_pool = data[offset]
         op_type = OpType(flags_and_pool >> 6)
         pool = flags_and_pool & 0x3F
@@ -751,16 +718,16 @@ class RawPacker(IPacker):
                 # commit_sent
                 # done
                 return cls.OPRecortWP.pack(flags_and_pool, pg,
-                                           discretize(op.duration),
-                                           discretize(queued_for_pg),
-                                           discretize(reached_pg),
-                                           discretize(op.evt_map['started']),
-                                           discretize(wait_for_subop),
-                                           discretize(op.evt_map['op_commit']),
-                                           discretize(op.evt_map['op_applied']),
-                                           discretize(sub_op_commit_rec),
-                                           discretize(op.evt_map['commit_sent']),
-                                           discretize(op.evt_map['done']))
+                                           DiscretizerExt.discretize(op.duration),
+                                           DiscretizerExt.discretize(queued_for_pg),
+                                           DiscretizerExt.discretize(reached_pg),
+                                           DiscretizerExt.discretize(op.evt_map['started']),
+                                           DiscretizerExt.discretize(wait_for_subop),
+                                           DiscretizerExt.discretize(op.evt_map['op_commit']),
+                                           DiscretizerExt.discretize(op.evt_map['op_applied']),
+                                           DiscretizerExt.discretize(sub_op_commit_rec),
+                                           DiscretizerExt.discretize(op.evt_map['commit_sent']),
+                                           DiscretizerExt.discretize(op.evt_map['done']))
 
             if op.tp == OpType.write_secondary:
                 # first queued_for_pg
@@ -770,28 +737,23 @@ class RawPacker(IPacker):
                 # sub_op_applied
                 # done
                 return cls.OPRecortWS.pack(flags_and_pool, pg,
-                                           discretize(op.duration),
-                                           discretize(queued_for_pg),
-                                           discretize(reached_pg),
-                                           discretize(op.evt_map['started']),
-                                           discretize(op.evt_map['commit_sent']),
-                                           discretize(op.evt_map['sub_op_applied']),
-                                           discretize(op.evt_map['done']))
+                                           DiscretizerExt.discretize(op.duration),
+                                           DiscretizerExt.discretize(queued_for_pg),
+                                           DiscretizerExt.discretize(reached_pg),
+                                           DiscretizerExt.discretize(op.evt_map['started']),
+                                           DiscretizerExt.discretize(op.evt_map['commit_sent']),
+                                           DiscretizerExt.discretize(op.evt_map['sub_op_applied']),
+                                           DiscretizerExt.discretize(op.evt_map['done']))
         except KeyError:
-            import pprint
-            pprint.pprint(op.evt_map)
+            logger.error(pprint.pprint(op.evt_map))
             raise
         assert op.tp == OpType.read, "Unknown op type {}".format(op.tp)
         return b""
-        # return cls.OPRecortR.pack(flags_and_pool, pg,
-        #                           discretize(op.duration),
-        #                           discretize(queued_for_pg),
-        #                           discretize(reached_pg))
 
     @classmethod
     def unpack_op(cls, data: bytes, offset: int) -> Tuple[Dict[str, Any], int]:
 
-        undiscretize_l = undiscretize_map.__getitem__  # type: Callable[[int], float]
+        undiscretize_l = DiscretizerExt.table.__getitem__  # type: Callable[[int], float]
         flags_and_pool = data[offset]
         op_type = OpType(flags_and_pool >> 6)
         pool = flags_and_pool & 0x3F
@@ -832,14 +794,6 @@ class RawPacker(IPacker):
                     'packer': cls.name}, offset + cls.OPRecortWS.size
 
         assert False, "Unknown op type {}".format(op_type)
-        # assert op_type == OpType.read, "Unknown op type {}".format(op_type)
-        # _, pg, duration, wait_for_pg, local_io = cls.OPRecortR.unpack(data[offset: offset + cls.OPRecortR.size])
-        # return {'tp': op_type,
-        #         'pack_pool_id': pool,
-        #         'pg': pg,
-        #         'duration': undiscretize_l(duration),
-        #         'wait_for_pg': undiscretize_l(wait_for_pg),
-        #         'local_io': undiscretize_l(local_io)}, offset + cls.OPRecortR.size
 
     @staticmethod
     def format_op(op: Dict[str, Any]) -> str:
@@ -1131,6 +1085,40 @@ class CephDumper:
 
 BinInfoFunc = Callable[[], List[BinaryFileRec]]
 
+responce = """HTTP/1.1 {code} {msg}
+Content-Length: {lenght}
+Content-Type: {content_type}
+Encoding: utf8
+
+"""
+
+
+def make_responce(code: http.HTTPStatus, data: str = None, content_type: str = None) -> bytes:
+    if content_type is None:
+        content_type = 'text/json' if code == http.HTTPStatus.OK else 'text/txt'
+    data_b = b"" if data is None else data.encode("utf8")
+    return responce.format(code=code, msg=code.phrase, content_type=content_type,
+                           lenght=len(data_b)).encode("utf8") + data_b
+
+
+resp_not_found = make_responce(http.HTTPStatus.NOT_FOUND)
+resp_bad_request = make_responce(http.HTTPStatus.BAD_REQUEST)
+
+
+def dict2str_helper(dct: Dict[str, Any], prefix: str) -> List[str]:
+    res = []
+    for k, v in dct.items():
+        assert isinstance(k, str)
+        if isinstance(v, dict):
+            res.extend(dict2str_helper(v, prefix + k + "::"))
+        else:
+            res.append("{}{} {}".format(prefix, k, v))
+    return res
+
+
+def dict2str(dct: Dict[str, Any]) -> str:
+    return "\n".join(dict2str_helper(dct, ""))
+
 
 class DumpLoop:
     sigusr_requested_handlers = ["cluster_info", "pg_dump"]
@@ -1178,18 +1166,54 @@ class DumpLoop:
 
         writer.close()
 
+    async def handle_http(self, reader, writer):
+        addr = writer.get_extra_info('peername')
+        logger.debug("Get new conn from %s", addr)
+
+        try:
+            req = []
+            while True:
+                line = (await reader.readline()).decode("utf8")
+                if line.strip() == '':
+                    break
+                req.append(line)
+
+            if not req:
+                logger.warning("Get empty request from %s", addr)
+                writer.write(resp_bad_request)
+            else:
+                try:
+                    get, path, *extra = req[0].split()
+                except ValueError:
+                    logger.warning("Get incorrect request from %s: %s", addr, req[0])
+                    writer.write(resp_bad_request)
+                else:
+                    logger.debug("Get cmd %s from %s", path, addr)
+                    if path == '/status.json':
+                        writer.write(make_responce(http.HTTPStatus.OK, json.dumps(self.status)))
+                    elif path == '/status.txt':
+                        writer.write(make_responce(http.HTTPStatus.OK, dict2str(self.status) + "\n"))
+                    else:
+                        writer.write(resp_not_found)
+        except:
+            writer.write(make_responce(code=http.HTTPStatus.INTERNAL_SERVER_ERROR, data=traceback.format_exc()))
+            raise
+        finally:
+            await writer.drain()
+            writer.close()
+
     async def start_info_server(self, addr: str):
         ip, port_s = addr.split(":")
         logger.info("Start server on addr %s", addr)
         port = int(port_s)
-        self.server = await asyncio.start_server(self.handle_conn, ip, port, loop=self.loop)
+        self.server = await asyncio.start_server(self.handle_http, ip, port, loop=self.loop)
 
     async def start(self):
         for name in self.handlers:
             self.start_handler(name, repeat=True)
 
-        if self.opts.server_addr:
-            await self.start_info_server(self.opts.server_addr)
+        if self.opts.http_server_addr:
+            await self.start_info_server(self.opts.http_server_addr)
 
     def fill_handlers(self) -> None:
         ctime = time.time()
@@ -1363,7 +1387,7 @@ def parse_args(argv: List[str]) -> Any:
     subparsers.add_parser('set_default', help="config osd's historic ops to default 20/600")
 
     record_parser = subparsers.add_parser('record', help="Dump osd's requests periodically")
-    record_parser.add_argument("--server-addr", default=None, help="TCP addr for status socket")
+    record_parser.add_argument("--http-server-addr", default=None, help="Addr for status http server")
     record_parser.add_argument("--duration", required=True, type=int, help="Duration to keep")
     record_parser.add_argument("--size", required=True, type=int, help="Num request to keep")
     record_parser.add_argument("--timeout", type=int, default=30, help="Timeout to run cli cmds")

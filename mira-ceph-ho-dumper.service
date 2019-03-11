@@ -8,5 +8,5 @@ Type=simple
 User={USER}
 ExecStart={PYTHON} {PY_FILE} --log-level {LOG_LEVEL} --log {LOG_FILE} record {DUMP_UNKNOWN_HEADERS} \
     --packer {PACKER} --min-duration {MIN_DURATION} --duration {DURATION} --size {SIZE} \
-    --server-addr {STATUS_CONN_ADDR} {PRIMARY} {RESULT}
+    --http-server-addr {STATUS_CONN_ADDR} {PRIMARY} {RESULT}
 StandardOutput=null

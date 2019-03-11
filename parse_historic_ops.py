@@ -1,6 +1,5 @@
 import os
 import sys
-import time
 
 import math
 import logging
@@ -527,22 +526,22 @@ def top_slow_nodes(df: pandas.DataFrame, count: int = 10, time_limit: int = 100)
     last_n = lambda ddf: ddf.sort_values(ascending=False)[:count].items()
 
     res = Table("Nodes with most slow requests counts:", ["Node", "Count"])
-    for node, cnt in last_n(df['node'][df['duration'] > time_limit].value_counts()):
+    for node, cnt in last_n(df['host'][df['duration'] > time_limit].value_counts()):
         res.add_line(node, cnt)
     yield res
 
     res = Table("Nodes with longest io:", ["Node", "Time"])
-    for node, total in last_n(df.groupby(['node'])['local_io'].agg('sum')):
+    for node, total in last_n(df.groupby(['host'])['local_io'].agg('sum')):
         res.add_line(node, seconds_to_str(total))
     yield res
 
     res = Table("Nodes with longest pg wait:", ["Node", "Time"])
-    for node, total in last_n(df.groupby(['node'])['wait_for_pg'].agg('sum')):
+    for node, total in last_n(df.groupby(['host'])['wait_for_pg'].agg('sum')):
         res.add_line(node, seconds_to_str(total))
     yield res
 
     res = Table("Nodes with longest net transfer time:", ["Node", "Time"])
-    for node, total in last_n(df.groupby(['node'])['download'].agg('sum')):
+    for node, total in last_n(df.groupby(['host'])['download'].agg('sum')):
         res.add_line(node, seconds_to_str(total))
     yield res
 
@@ -752,7 +751,7 @@ def main(argv: List[str]) -> int:
                     print(table2txt(table))
                     print()
 
-            if opts.slow_node or opts.all and 'node' in df:
+            if (opts.slow_node or opts.all) and 'host' in df:
                 for table in top_slow_nodes(df, opts.count):
                     print(table2txt(table))
                     print()

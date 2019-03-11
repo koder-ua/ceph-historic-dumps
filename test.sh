@@ -2,19 +2,23 @@
 set -o pipefail
 set -o errexit
 set -o nounset
+set -x
 
-bash deploy.sh --clean
-bash deploy.sh --show
-bash deploy.sh --deploy
-bash deploy.sh --start --parallel
-bash deploy.sh --show --parallel
-bash deploy.sh --clean --parallel --jobs 2
-bash deploy.sh --deploy --parallel
-bash deploy.sh --start
+readonly NODES="$1"
+
+bash deploy.sh --clean "${NODES}"
+bash deploy.sh --show "${NODES}"
+bash deploy.sh --deploy "${NODES}"
+bash deploy.sh --start --parallel "${NODES}"
+bash deploy.sh --show --parallel "${NODES}"
+bash deploy.sh --clean --parallel --jobs 2 "${NODES}"
+bash deploy.sh --deploy --parallel "${NODES}"
+bash deploy.sh --start "${NODES}"
 sleep 2
-bash deploy.sh --collect
-bash deploy.sh --collect --parallel --jobs 3
-bash deploy.sh --redeploy
-bash deploy.sh --collect --parallel
-bash deploy.sh --clean
-bash deploy.sh --show
+bash deploy.sh --collect "${NODES}"
+bash deploy.sh --collect --parallel --jobs 3 "${NODES}"
+bash deploy.sh --redeploy "${NODES}"
+bash deploy.sh --collect --parallel "${NODES}"
+bash deploy.sh --clean "${NODES}"
+bash deploy.sh --show "${NODES}"
+echo "Passed successfully!"

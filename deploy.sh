@@ -24,13 +24,6 @@ readonly TEST_PRIMARY_OPTS="--record-cluster 30 --record-pg-dump 60"
 readonly TEST_DUMP_HEADERS="--dump-unparsed-headers"
 readonly TEST_LOG_LEVEL="DEBUG"
 
-readonly ALL_NODES="ceph01 ceph02 ceph03"
-#readonly ALL_NODES="osd001 osd002 osd003 osd004 osd005 osd006 osd007 osd008 osd009 osd010 osd011 osd012"
-#ALL_NODES1="ceph01 ceph02 ceph03 ceph04 ceph05 ceph06 ceph07 ceph08 ceph09 ceph10"
-#ALL_NODES1="$ALL_NODES1 ceph11 ceph12 ceph13 ceph14 ceph15 ceph16 ceph17 ceph18 ceph19"
-#ALL_NODES1="$ALL_NODES1 ceph20 ceph21 ceph22 ceph23 ceph24 ceph25 ceph26 ceph27 ceph28 ceph29"
-#readonly ALL_NODES="$ALL_NODES1 ceph30 ceph31 ceph32 ceph33 ceph34 ceph35 ceph36 ceph38 ceph39 ceph40 ceph41 ceph42"
-
 # ALMOST CONSTANT
 readonly MAX_COMMUNICATION_TIMEOUT=15
 readonly PYTHON="/usr/bin/python3.5"
@@ -64,7 +57,6 @@ readonly _RES_BASE=$(basename "${RESULT}")
 readonly COPY_RESULT="${_RES_DIR}/copy_${_RES_BASE}"
 
 readonly SRV_FILE_DST_PATH="/lib/systemd/system/${SRV_FILE}"
-readonly DEFAULT_JOBS=$(echo "${ALL_NODES}" | wc --words)
 
 
 function split_array {
@@ -439,13 +431,52 @@ function get_pg_dump_time {
     local -r node="${1}"
     local -r port="${2}"
     local -r max_timeout="${3}"
-    echo 'info' | nc -w "${max_timeout}" "${node}" "${port}" | \
-        json_pp | grep '"pg_dump" :' | awk '{print $3}' | sed 's/,//'
+    curl --max-time "${max_timeout}" -s "http://${node}:${port}/status.txt" \
+        | grep "last_handler_run_at::pg_dump " \
+        | awk '{print $2}'
 }
+
+# ignore EOF code from 'read'
+set +e
+read -r -d '' HELP <<- EOM
+    Control ceph latency record service
+    USAGE bash deploy.sh COMMAND [OPTIONS] INVENTORY_FILE
+
+    Commands:
+    -c --clean             Stop and remove service along with all files, logs and results
+    -u --update            Update ${BIN} and restart service
+    -l --collect           Collect results to current or specified folder
+    -r --redeploy          Clean and redeploy system on and restart service
+    -d --deploy            Only copy files and register service
+    -s --show              Show current service status and record/log file size
+    -f --force-dump-info   Force primary node to dump all cluster info now
+    -t --tail              Show tail from service logs
+    -C --clean-output      Clean output files and restart service
+    -S --start             Start service
+    -T --stop              Stop service
+    -R --restart           Restart service
+    -p --pack              Pack collected to local dir records/logs to archive
+    --unpack               Unpack archive, previously packed with -p/--pack
+    -h --help              Get this help
+
+    Params:
+    --parallel -P          Run commands for nodes in parallel. By default task count equal to node count,
+                           but can be set with --jobs option
+    --jobs JOB_COUNT       Max job count for parallel execution
+    --lines COUNT          Lines count for -t/--tail command
+    --test                 Run in test mode (smaller timeouts for collectors, DEBUG log level)
+    --target NAME          Set folder to collect data to
+    --no-dump-info         Do not force to dump cluster info before collect (for -l/--collect only)
+    --collect-logs         Collect logs as wel as records (for -l/--collect only)
+    --wait-for-update      Wait for cluster to dump info (for -f/--force-dump-info only)
+
+    INVENTORY_FILE  list of all target nodes, one by line
+EOM
+set -e
+
 
 function main {
     local tgt=""
-    local jobs="${DEFAULT_JOBS}"
     local tail_lines="${DEFAULT_TAIL_LINES}"
     local parallel="0"
     local parallel_prefix=""
@@ -454,10 +485,36 @@ function main {
     local collect_logs="0"
     local wait_for_update="0"
 
+    if [[ "$#" == "0" ]] ; then
+        >&2 echo "${HELP}"
+        exit 1
+    fi
+
     local -r command="${1}"
     shift
 
-    while [[ "$#" != "0" ]] ; do
+    if [[ "${command}" == "-h" ]] || [[ "${command}" == "--help" ]] ; then
+        echo "${HELP}"
+        exit 0
+    fi
+
+    if [[ "$#" < "1" ]] ; then
+        >&2 echo "${HELP}"
+        exit 1
+    fi
+
+    local -r inventory_file="${@: -1}"
+    if [[ ! -f "${inventory_file}" ]] ; then
+        >&2 echo "No inventory file provided (or invalid provided)"
+        exit 1
+    fi
+
+    local -r all_nodes=$(tr '\n' ' ' <"${inventory_file}")
+    local jobs=$(echo "${all_nodes}" | wc --words)
+
+    # parse options
+    # skip last parameter - it is inventory
+    while [[ "$#" != "1" ]] ; do
         case "${1}" in
         --jobs)
             jobs="${2}"
@@ -487,7 +544,7 @@ function main {
             wait_for_update="1"
             ;;
         *)
-            echo "Unknown extra option ${1}" 1>&2
+            >&2 echo "Unknown extra option ${1}"
             exit 1
             ;;
         esac
@@ -495,12 +552,12 @@ function main {
     done
 
     if ! [[ "${jobs}" =~ ^[0-9]+$ ]] ; then
-        echo "Incorrect job count: '${jobs}'" 1>&2
+        >&2 echo "Incorrect job count: '${jobs}'"
         exit 1
     fi
 
     if ! [[ "${tail_lines}" =~ ^[0-9]+$ ]] ; then
-        echo "Incorrect tail lines count: '${tail_lines}'" 1>&2
+        >&2 echo "Incorrect tail lines count: '${tail_lines}'"
         exit 1
     fi
 
@@ -508,14 +565,15 @@ function main {
         parallel_prefix="run_parallel ${jobs}"
     fi
 
-    local -r first_node=$(echo "${ALL_NODES}" | awk '{print $1}')
+    local -r first_node=$(echo "${all_nodes}" | awk '{print $1}')
+    echo "${first_node}"
 
     case "${command}" in
     -c|--clean)
-        ${parallel_prefix} clean "${ALL_NODES}"
+        ${parallel_prefix} clean "${all_nodes}"
         ;;
     -u|--update)
-        ${parallel_prefix} update_bin "${ALL_NODES}"
+        ${parallel_prefix} update_bin "${all_nodes}"
         ;;
     -l|--collect)
         if [[ "${no_dump_info}" == "0" ]] ; then
@@ -525,20 +583,20 @@ function main {
         if [[ "${tgt}" != "" ]] && [[ ! -d "${tgt}" ]] ; then
             mkdir --parents "${tgt}"
         fi
-        ${parallel_prefix} collect "${ALL_NODES}" "${tgt}" "${collect_logs}"
+        ${parallel_prefix} collect "${all_nodes}" "${tgt}" "${collect_logs}"
         ;;
     -r|--redeploy)
-        ${parallel_prefix} redeploy "${ALL_NODES}" "${first_node}" "${test}"
-        ${parallel_prefix} show "${ALL_NODES}" | sort
+        ${parallel_prefix} redeploy "${all_nodes}" "${first_node}" "${test}"
+        ${parallel_prefix} show "${all_nodes}" | sort
         ;;
     -d|--deploy)
-        ${parallel_prefix} deploy "${ALL_NODES}" "${first_node}" "${test}"
+        ${parallel_prefix} deploy "${all_nodes}" "${first_node}" "${test}"
         ;;
     -s|--show)
         if [[ "${parallel}" == "1" ]] ; then
-            ${parallel_prefix} show "${ALL_NODES}" | sort
+            ${parallel_prefix} show "${all_nodes}" | sort
         else
-            show "${ALL_NODES}"
+            show "${all_nodes}"
         fi
         ;;
     -f|--force-dump-info)
@@ -549,22 +607,22 @@ function main {
             echo "-t/--tail does not support parallel execution" 1>&2
             exit 1
         fi
-        tails "${ALL_NODES}" "${tail_lines}"
+        tails "${all_nodes}" "${tail_lines}"
         shift
         ;;
     -C|--clean-output)
-        ${parallel_prefix} stop "${ALL_NODES}"
-        ${parallel_prefix} clean_output "${ALL_NODES}"
-        ${parallel_prefix} start "${ALL_NODES}"
+        ${parallel_prefix} stop "${all_nodes}"
+        ${parallel_prefix} clean_output "${all_nodes}"
+        ${parallel_prefix} start "${all_nodes}"
         ;;
     -S|--start)
-        ${parallel_prefix} start "${ALL_NODES}"
+        ${parallel_prefix} start "${all_nodes}"
         ;;
     -T|--stop)
-        ${parallel_prefix} stop "${ALL_NODES}"
+        ${parallel_prefix} stop "${all_nodes}"
         ;;
     -R|--restart)
-        ${parallel_prefix} restart "${ALL_NODES}"
+        ${parallel_prefix} restart "${all_nodes}"
         ;;
     -p|--pack)
         local -r result_file="last.tar"
