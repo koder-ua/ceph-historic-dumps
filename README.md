@@ -15,12 +15,12 @@ How to collect data:
         - curl -L https://api.github.com/repos/koder-ua/ceph-historic-dumps/tarball -o ceph-historic-dumps.tar.gz
         - mkdir ceph-historic-dumps && cd ceph-historic-dumps
         - tar --strip-components=1 -xvzf ../ceph-historic-dumps.tar.gz
-    * 'bash ./deploy.sh -d -P INVENTORY_FILE' to deploy
-    * 'bash ./deploy.sh -S -P INVENTORY_FILE' to start services
-    * 'bash ./deploy.sh -s -P INVENTORY_FILE' to check current status - all nodes should run daemon
+    * './ctl -d -P INVENTORY_FILE' to deploy
+    * './ctl -S -P INVENTORY_FILE' to start services
+    * './ctl -s -P INVENTORY_FILE' to check current status - all nodes should run daemon
       and log file should grows at about 1-10KiBps per minute speed
-    * 'bash ./deploy.sh -l -P INVENTORY_FILE' to collect records file from all nodes
-    * 'bash ./deploy.sh -c -P INVENTORY_FILE' to stop logger and clean all nodes (you need to collect logs first)
+    * './ctl -l -P INVENTORY_FILE' to collect records file from all nodes
+    * './ctl -c -P INVENTORY_FILE' to stop logger and clean all nodes (you need to collect logs first)
 
 
 How to create report:

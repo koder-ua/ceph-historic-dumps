@@ -505,10 +505,30 @@ function main {
         exit 0
     fi
 
+    case "${command}" in
+    -p|--pack)
+        local -r result_file="last.tar"
+        local -r log_arch=logs.tar.bz2
+        tar cvjf "${log_arch}" *.log
+        tar cvf "${result_file}" "${log_arch}" *.bin
+        rm -f "${log_arch}"
+        exit 0
+        ;;
+    --unpack)
+        local -r result_file="last.tar"
+        local -r log_arch=logs.tar.bz2
+        tar xvf "${result_file}"
+        tar xvjf "${log_arch}"
+        rm -f "${log_arch}"
+        exit 0
+        ;;
+    esac
+
     if [[ "$#" < "1" ]] ; then
         >&2 echo "${HELP}"
         exit 1
     fi
+
 
     local -r inventory_file="${@: -1}"
     if [[ ! -f "${inventory_file}" ]] ; then
@@ -629,20 +649,6 @@ function main {
         ;;
     -R|--restart)
         ${parallel_prefix} restart "${all_nodes}"
-        ;;
-    -p|--pack)
-        local -r result_file="last.tar"
-        local -r log_arch=logs.tar.bz2
-        tar cvjf "${log_arch}" *.log
-        tar cvf "${result_file}" "${log_arch}" *.bin
-        rm -f "${log_arch}"
-        ;;
-    --unpack)
-        local -r result_file="last.tar"
-        local -r log_arch=logs.tar.bz2
-        tar xvf "${result_file}"
-        tar xvjf "${log_arch}"
-        rm -f "${log_arch}"
         ;;
     *)
         echo "Incorrect option provided ${command}" 1>&2

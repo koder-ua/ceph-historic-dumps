@@ -38,7 +38,12 @@ class ClusterInfo:
                                   "osd_node": nodes})
         storage['osd_params'] = frame
 
-        pools_ids, pools_names = map(list, zip(*self.pool_id2name.items()))
+        if self.pool_id2name:
+            pools_ids, pools_names = map(list, zip(*self.pool_id2name.items()))
+        else:
+            pools_ids = []
+            pools_names = []
+
         frame = pandas.DataFrame({"pool_name": pools_names, "pool_id": pools_ids})
         storage['pool_params'] = frame
 
