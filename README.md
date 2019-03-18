@@ -6,10 +6,15 @@ How to collect data:
     * You need user with passwordless ssh to all required osd nodes and passwordless sudo on all of them
     * create inventory file - file, with list of all ceph osd nodes one per line by name or by ip,
       on which sshd listening
-    * Run 'git clone https://github.com/koder-ua/ceph-historic-dumps.git' on any node,
+    * If you can run 'git clone':
+        - Run 'git clone https://github.com/koder-ua/ceph-historic-dumps.git' on any node,
       which has an access to all osd nodes
-    * cd ceph-historic-dumps
-    * git checkout stable
+        - cd ceph-historic-dumps
+        - git checkout stable
+    * If you can't run 'git clone' (beware this one is downloading current master branch)
+        - curl -L https://api.github.com/repos/koder-ua/ceph-historic-dumps/tarball -o ceph-historic-dumps.tar.gz
+        - mkdir ceph-historic-dumps && cd ceph-historic-dumps
+        - tar --strip-components=1 -xvzf ../ceph-historic-dumps.tar.gz
     * 'bash ./deploy.sh -d -P INVENTORY_FILE' to deploy
     * 'bash ./deploy.sh -S -P INVENTORY_FILE' to start services
     * 'bash ./deploy.sh -s -P INVENTORY_FILE' to check current status - all nodes should run daemon
@@ -21,9 +26,9 @@ How to collect data:
 How to create report:
 
     * Checkout stable label, as described above
-    * python3.X -m venv collect_env
+    * python3.6 -m venv collect_env
     * source collect_env/bin/activate
     * cd ceph-historic-dumps
     * pip install -r requirements.txt
-    * python parse_historic_ops.py tohdfs HDF_FILE ALL_RECORD_FILES
-    * python parse_historic_ops.py report --all HDF_FILE
+    * python -m collect_historic_ops.hdfutil tohdfs HDF_FILE ALL_RECORD_FILES
+    * python -m collect_historic_ops.report report --all HDF_FILE

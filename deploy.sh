@@ -27,7 +27,8 @@ readonly TEST_LOG_LEVEL="DEBUG"
 # ALMOST CONSTANT
 readonly MAX_COMMUNICATION_TIMEOUT=15
 readonly PYTHON="/usr/bin/python3.5"
-readonly BIN="ceph_ho_dumper.py"
+readonly BIN="collector.py"
+readonly BIN_PATH="collect_historic_ops/${BIN}"
 readonly TARGET="/tmp/${BIN}"
 readonly SHELL="/bin/bash"
 readonly LOG="/tmp/ceph_ho_dumper.log"
@@ -208,15 +209,55 @@ function clean {
     fi
 }
 
-function update_bin {
+function update_code {
     local -r nodes="${1}"
     local cmd
     for node in ${nodes} ; do
-        do_scp "${BIN}" "${node}:${TARGET}"
+        do_scp "${BIN_PATH}" "${node}:${TARGET}"
         cmd="systemctl stop ${SERVICE} || true && chown ${TARGET_USER_GRP} '${TARGET}' && "
         cmd+="chmod ${FILE_MODE} '${TARGET}' && systemctl start ${SERVICE}"
         do_ssh_sudo "${node}" "${cmd}"
     done
+}
+
+function fill_srv {
+    local -r primary="${1}"
+    local -r test="${2}"
+
+    local size="${RECORD_SIZE}"
+    local log_level="${LOG_LEVEL}"
+    local record_duration="${RECORD_DURATION}"
+    local min_duration="${MIN_DURATION}"
+
+    if [[ "${test}" == "1" ]] ; then
+        size="${TEST_RECORD_SIZE}"
+        log_level="${TEST_LOG_LEVEL}"
+        record_duration="${TEST_RECORD_DURATION}"
+        min_duration="${TEST_MIN_DURATION}"
+    fi
+
+    local popt=""
+    if [[ "${primary}" == "1" ]] ; then
+        if [[ "${test}" == "1" ]] ; then
+            popt="${TEST_PRIMARY_OPTS}"
+        else
+            popt="${PRIMARY_OPTS}"
+        fi
+    fi
+
+    sed --expression "s/{DURATION}/${record_duration}/" \
+         --expression "s/{SIZE}/${size}/" \
+         --expression "s/{PACKER}/${PACKER}/" \
+         --expression "s/{STATUS_CONN_ADDR}/${STATUS_CONN_ADDR}/" \
+         --expression "s/{LOG_LEVEL}/${log_level}/" \
+         --expression "s/{DUMP_UNKNOWN_HEADERS}/${DUMP_HEADERS}/" \
+         --expression "s/{MIN_DURATION}/${min_duration}/" \
+         --expression "s/{PRIMARY}/${popt}/" \
+         --expression "s/{PYTHON}/${PYTHON//\//\\/}/" \
+         --expression "s/{PY_FILE}/${TARGET//\//\\/}/" \
+         --expression "s/{LOG_FILE}/${LOG//\//\\/}/" \
+         --expression "s/{USER}/${TARGET_USER}/" \
+         --expression "s/{RESULT}/${RESULT//\//\\/}/" < "${SRV_FILE}"
 }
 
 function deploy {
@@ -225,52 +266,18 @@ function deploy {
     local -r test="${3}"
     local cmd
     local srv_file
-    local popt
+    local primary
 
     for node in ${nodes} ; do
-        do_scp "${BIN}" "${node}:${TARGET}"
+        do_scp "${BIN_PATH}" "${node}:${TARGET}"
 
         if [[ "${node}" == "${first_node}" ]] ; then
-            if [[ "${test}" == "1" ]] ; then
-                popt="${TEST_PRIMARY_OPTS}"
-            else
-                popt="${PRIMARY_OPTS}"
-            fi
+            primary="1"
         else
-            popt=""
+            primary="0"
         fi
 
-        if [[ "${test}" == "1" ]] ; then
-            srv_file=$(sed --expression "s/{DURATION}/${TEST_RECORD_DURATION}/" \
-                           --expression "s/{SIZE}/${TEST_RECORD_SIZE}/" \
-                           --expression "s/{PACKER}/${PACKER}/" \
-                           --expression "s/{STATUS_CONN_ADDR}/${STATUS_CONN_ADDR}/" \
-                           --expression "s/{LOG_LEVEL}/${TEST_LOG_LEVEL}/" \
-                           --expression "s/{DUMP_UNKNOWN_HEADERS}/${DUMP_HEADERS}/" \
-                           --expression "s/{MIN_DURATION}/${TEST_MIN_DURATION}/" \
-                           --expression "s/{PRIMARY}/${popt}/" \
-                           --expression "s/{PYTHON}/${PYTHON//\//\\/}/" \
-                           --expression "s/{PY_FILE}/${TARGET//\//\\/}/" \
-                           --expression "s/{LOG_FILE}/${LOG//\//\\/}/" \
-                           --expression "s/{USER}/${TARGET_USER}/" \
-                           --expression "s/{RESULT}/${RESULT//\//\\/}/" < "${SRV_FILE}")
-        else
-            srv_file=$(sed --expression "s/{DURATION}/${RECORD_DURATION}/" \
-                           --expression "s/{SIZE}/${RECORD_SIZE}/" \
-                           --expression "s/{PACKER}/${PACKER}/" \
-                           --expression "s/{STATUS_CONN_ADDR}/${STATUS_CONN_ADDR}/" \
-                           --expression "s/{LOG_LEVEL}/${LOG_LEVEL}/" \
-                           --expression "s/{DUMP_UNKNOWN_HEADERS}/${DUMP_HEADERS}/" \
-                           --expression "s/{MIN_DURATION}/${MIN_DURATION}/" \
-                           --expression "s/{PRIMARY}/${popt}/" \
-                           --expression "s/{PYTHON}/${PYTHON//\//\\/}/" \
-                           --expression "s/{PY_FILE}/${TARGET//\//\\/}/" \
-                           --expression "s/{LOG_FILE}/${LOG//\//\\/}/" \
-                           --expression "s/{USER}/${TARGET_USER}/" \
-                           --expression "s/{RESULT}/${RESULT//\//\\/}/" < "${SRV_FILE}")
-        fi
-
-        echo "${srv_file}" | ${SSH_CMD} "${node}" "cat > /tmp/${SRV_FILE}"
+        fill_srv "${primary}" "${test}" | ${SSH_CMD} "${node}" "cat > /tmp/${SRV_FILE}"
 
         cmd="chown ${TARGET_USER_GRP} '${TARGET}' && "
         cmd+="chmod ${FILE_MODE} '${TARGET}' && "
@@ -566,14 +573,13 @@ function main {
     fi
 
     local -r first_node=$(echo "${all_nodes}" | awk '{print $1}')
-    echo "${first_node}"
 
     case "${command}" in
     -c|--clean)
         ${parallel_prefix} clean "${all_nodes}"
         ;;
     -u|--update)
-        ${parallel_prefix} update_bin "${all_nodes}"
+        ${parallel_prefix} update_code "${all_nodes}"
         ;;
     -l|--collect)
         if [[ "${no_dump_info}" == "0" ]] ; then

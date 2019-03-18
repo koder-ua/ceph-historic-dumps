@@ -1,18 +1,14 @@
 #!/usr/bin/env python3.5
-import http
 import os
 import re
 import sys
 import bz2
 import abc
-import traceback
-from io import BytesIO
-
-import math
 import stat
 import json
 import time
 import zlib
+import http
 import bisect
 import socket
 import signal
@@ -22,12 +18,13 @@ import os.path
 import logging
 import argparse
 import datetime
+import traceback
 import subprocess
 from enum import Enum
+from io import BytesIO
 from struct import Struct
 from functools import partial
 from collections import defaultdict
-
 from typing.io import BinaryIO, TextIO
 from typing import List, Dict, Tuple, Iterator, Any, Optional, Union, Callable, Set, Type, cast, NewType, NamedTuple, \
     Iterable, Awaitable, Match
